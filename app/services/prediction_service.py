@@ -79,7 +79,7 @@ def _game_to_dict(game: Game, prediction: Prediction | None) -> dict:
         "api_sports_id": game.api_sports_id,
         "home_team": game.home_team.name,
         "away_team": game.away_team.name,
-        "tip_off": game.tip_off,
+        "tip_off": game.date,
         "status": game.status,
         "prediction": pred_block,
     }
@@ -97,13 +97,13 @@ async def _fetch_games_with_predictions(
     """
     stmt = (
         select(Game)
-        .where(Game.tip_off >= start, Game.tip_off < end)
+        .where(Game.date >= start, Game.date < end)
         .options(
             selectinload(Game.home_team),
             selectinload(Game.away_team),
             selectinload(Game.prediction),
         )
-        .order_by(Game.tip_off.asc())
+        .order_by(Game.date.asc())
     )
     result = await db.execute(stmt)
     games: list[Game] = list(result.scalars().all())
@@ -141,15 +141,15 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
     stmt = (
         select(Game)
         .where(
-            Game.tip_off >= start,
-            Game.tip_off < end,
+            Game.date >= start,
+            Game.date < end,
             Game.status.in_(scheduled_statuses),
         )
         .options(
             selectinload(Game.home_team),
             selectinload(Game.away_team),
         )
-        .order_by(Game.tip_off.asc())
+        .order_by(Game.date.asc())
     )
     result = await db.execute(stmt)
     games: list[Game] = list(result.scalars().all())
@@ -339,22 +339,24 @@ async def get_top_predictions(
     ValueError
         If ``prediction_type`` is not one of the accepted values.
     """
-    # Map prediction_type → (pick column, trust column, line column)
+    # Map prediction_type → (pick column, trust column, game line attr name)
+    # NOTE: O/U lines live on Game (ou_line, ht_ou_line), NOT on Prediction.
+    # We store the Game attribute name as a string and look it up with getattr.
     _type_map: dict[str, tuple] = {
         "winner": (
             Prediction.winner_pick,
             Prediction.winner_trust,
-            None,  # no line for winner picks
+            None,           # no O/U line for winner picks
         ),
         "ft_ou": (
             Prediction.ft_ou_pick,
             Prediction.ft_ou_trust,
-            Prediction.ft_ou_line,
+            "ou_line",      # Game.ou_line
         ),
         "ht_ou": (
             Prediction.ht_ou_pick,
             Prediction.ht_ou_trust,
-            Prediction.ht_ou_line,
+            "ht_ou_line",   # Game.ht_ou_line
         ),
     }
 
@@ -364,7 +366,7 @@ async def get_top_predictions(
             f"Must be one of: {list(_type_map.keys())}"
         )
 
-    pick_col, trust_col, line_col = _type_map[prediction_type]
+    pick_col, trust_col, game_line_attr = _type_map[prediction_type]
 
     # Only consider games that tip off within the next 24 hours so the
     # top-picks list stays actionable.
@@ -374,7 +376,7 @@ async def get_top_predictions(
     stmt = (
         select(Game, Prediction)
         .join(Prediction, Prediction.game_id == Game.id)
-        .where(Game.tip_off >= now, Game.tip_off < end)
+        .where(Game.date >= now, Game.date < end)
         .options(
             selectinload(Game.home_team),
             selectinload(Game.away_team),
@@ -390,14 +392,14 @@ async def get_top_predictions(
     for game, prediction in rows:
         pick = getattr(prediction, pick_col.key)
         trust = getattr(prediction, trust_col.key)
-        line = getattr(prediction, line_col.key) if line_col is not None else None
+        line = getattr(game, game_line_attr) if game_line_attr is not None else None
 
         items.append(
             {
                 "game_id": game.id,
                 "home_team": game.home_team.name,
                 "away_team": game.away_team.name,
-                "tip_off": game.tip_off,
+                "tip_off": game.date,
                 "pick": pick,
                 "trust": trust,
                 "line": line,

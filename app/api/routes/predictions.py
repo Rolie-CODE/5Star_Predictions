@@ -23,7 +23,7 @@ from app.services import prediction_service
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/predictions", tags=["Predictions"])
+router = APIRouter(tags=["Predictions"])
 
 # Convenience type alias for the DB dependency
 DBSession = Annotated[AsyncSession, Depends(get_db)]
