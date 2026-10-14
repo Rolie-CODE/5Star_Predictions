@@ -1,0 +1,49 @@
+# render.yaml
+# ──────────────────────────────────────────────────────────────────────────────
+# Render Infrastructure-as-Code for 5Star Predictions.
+# Commit this file to your repo. Render auto-detects it on connect.
+# Docs: https://render.com/docs/blueprint-spec
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+  - type: web
+    name: 5star-predictions-api
+    runtime: python
+    region: oregon          # Change to your preferred region
+    plan: free              # Upgrade to starter ($7/mo) for always-on
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: APP_ENV
+        value: production
+
+      - key: API_SPORTS_KEY
+        sync: false         # Set manually in Render dashboard — never hardcode
+
+      - key: API_SPORTS_BASE_URL
+        value: https://v1.basketball.api-sports.io
+
+      - key: NBA_LEAGUE_ID
+        value: "12"
+
+      - key: NBA_SEASON
+        value: "2025-2026"
+
+      - key: TOP_PREDICTIONS_LIMIT
+        value: "5"
+
+      # DATABASE_URL is injected automatically by the database block below
+      - key: DATABASE_URL
+        fromDatabase:
+          name: 5star-predictions-db
+          property: connectionString
+
+databases:
+  - name: 5star-predictions-db
+    databaseName: fivestar
+    plan: free              # Free tier lasts 90 days, then $7/mo
+    region: oregon

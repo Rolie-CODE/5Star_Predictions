@@ -1,0 +1,40 @@
+# Git ignore rules for 5Star Predictions
+# ──────────────────────────────────────
+
+# Environment / secrets — NEVER commit
+.env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# SQLite database (local dev only)
+*.db
+*.db-shm
+*.db-wal
+
+# Trained model files (large binaries — regenerate with `python -m app.ml.train`)
+app/ml/models/*.json
+!app/ml/models/.gitkeep
+
+# Alembic (keep versions, ignore local env files)
+alembic.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
