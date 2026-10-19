@@ -27,7 +27,8 @@ from sqlalchemy.orm import selectinload
 # These modules must exist in the project.  Adjust import paths if your
 # package layout differs.
 from app.db.models import Game, Prediction, Team  # ORM models
-from app.ml import feature_engineering, prediction_engine  # ML helpers
+from app.ml import features as feature_engineering  # ML helpers
+from app.ml.predict import prediction_engine
 
 logger = logging.getLogger(__name__)
 
