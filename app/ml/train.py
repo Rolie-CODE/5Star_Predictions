@@ -1,376 +1,317 @@
-"""
-app/ml/train.py
----------------
-Training script for 5Star Predictions XGBoost models.
+"""Train NBA prediction models from verified historical game data.
 
-Run from the project root with:
-    python -m app.ml.train
+Run from the project root with ``python -m app.ml.train``.  The winner model
+uses Kaggle and API-Sports results.  The full-game totals model uses Kaggle
+games with an observed sportsbook total.  No synthetic fallback is used.
 
-The script will:
-  1. Attempt to load historical Game + Prediction records from the database.
-  2. Fall back to synthetic NBA-realistic data when fewer than 100 finished
-     games exist (useful during initial development / CI).
-  3. Train three XGBClassifier models:
-       - winner_model   : predicts home win (1) vs away win (0)
-       - ft_ou_model    : predicts full-time Over (1) vs Under (0)
-       - ht_ou_model    : predicts halftime Over (1) vs Under (0)
-  4. Save each model to app/ml/models/<name>.json (XGBoost native format).
-  5. Write app/ml/models/metadata.json with accuracy stats and version info.
+Kaggle's historical totals file has full-game lines only, so this script keeps
+the existing halftime model untouched and marks it as legacy/unvalidated in
+metadata.  It must not be presented as a model trained on real halftime lines.
 """
 
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
-import os
-import sys
+import statistics
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
-# ---------------------------------------------------------------------------
-# Path helpers — allow `python -m app.ml.train` from project root
-# ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # …/5Star_Predictions
-MODELS_DIR = PROJECT_ROOT / "app" / "ml" / "models"
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Add project root to sys.path so internal imports resolve correctly.
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from app.ml.features import FEATURE_COLUMNS  # noqa: E402  (after sys.path patch)
-
-# ---------------------------------------------------------------------------
-# Reproducibility seed
-# ---------------------------------------------------------------------------
-RNG_SEED = 42
-np.random.seed(RNG_SEED)
-
-# ---------------------------------------------------------------------------
-# Minimum real-game records needed before we use the DB data
-# ---------------------------------------------------------------------------
-MIN_REAL_GAMES = 100
-
-# ---------------------------------------------------------------------------
-# XGBoost hyper-parameters (conservative defaults; tune as data grows)
-# ---------------------------------------------------------------------------
-XGB_PARAMS = dict(
-    n_estimators=300,
-    max_depth=4,
-    learning_rate=0.05,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    use_label_encoder=False,
-    eval_metric="logloss",
-    random_state=RNG_SEED,
-    verbosity=0,
+from app.ml.features import (
+    FEATURE_COLUMNS,
+    FT_OU_FEATURE_COLUMNS,
+    WINNER_FEATURE_COLUMNS,
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODELS_DIR = PROJECT_ROOT / "app" / "ml" / "models"
+KAGGLE_DIR = PROJECT_ROOT / "data" / "kaggle_nba"
+API_SPORTS_FILE = PROJECT_ROOT / "data" / "api_sports_nba_historical_2022_2025.csv"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Synthetic data generation
-# ---------------------------------------------------------------------------
+RNG_SEED = 42
+MIN_TRAINING_ROWS = 100
+BASELINE_PPG = 110.0
 
-def _generate_synthetic_data(n_samples: int = 2000) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Generate *n_samples* rows of synthetic NBA-realistic training data.
+# The live feature builder returns all 17 values.  Each model only consumes
+# features that were available in its corresponding real historical source.
+WINNER_FEATURES = WINNER_FEATURE_COLUMNS
+FT_OU_FEATURES = FT_OU_FEATURE_COLUMNS
 
-    Returns
-    -------
-    X : np.ndarray, shape (n_samples, len(FEATURE_COLUMNS))
-    y_winner : np.ndarray, shape (n_samples,)  — 1=home win, 0=away win
-    y_ft_ou  : np.ndarray, shape (n_samples,)  — 1=FT over, 0=FT under
-    y_ht_ou  : np.ndarray, shape (n_samples,)  — 1=HT over, 0=HT under
-    """
-    rng = np.random.default_rng(RNG_SEED)
-
-    # --- raw team stats ------------------------------------------------
-    home_ppg = rng.uniform(100, 125, n_samples)
-    home_oppg = rng.uniform(100, 125, n_samples)
-    home_win_pct = rng.uniform(0.2, 0.8, n_samples)
-    home_home_win_pct = np.clip(home_win_pct + rng.uniform(0.0, 0.15, n_samples), 0.0, 1.0)
-
-    away_ppg = rng.uniform(100, 125, n_samples)
-    away_oppg = rng.uniform(100, 125, n_samples)
-    away_win_pct = rng.uniform(0.2, 0.8, n_samples)
-    away_away_win_pct = np.clip(away_win_pct - rng.uniform(0.0, 0.15, n_samples), 0.0, 1.0)
-
-    # --- derived features ----------------------------------------------
-    home_net_rating = home_ppg - home_oppg
-    away_net_rating = away_ppg - away_oppg
-
-    ppg_diff = home_ppg - away_ppg
-    oppg_diff = home_oppg - away_oppg
-    net_rating_diff = home_net_rating - away_net_rating
-    win_pct_diff = home_win_pct - away_win_pct
-    expected_total = home_ppg + away_ppg
-
-    # O/U lines: set close to expected total with small noise
-    ou_noise = rng.normal(0, 3, n_samples)
-    ou_line = expected_total + ou_noise
-    ht_ou_noise = rng.normal(0, 2, n_samples)
-    ht_ou_line = (expected_total / 2) + ht_ou_noise  # rough halftime estimate
-
-    # --- assemble feature matrix in FEATURE_COLUMNS order --------------
-    col_data = {
-        "home_ppg": home_ppg,
-        "home_oppg": home_oppg,
-        "home_win_pct": home_win_pct,
-        "home_home_win_pct": home_home_win_pct,
-        "away_ppg": away_ppg,
-        "away_oppg": away_oppg,
-        "away_win_pct": away_win_pct,
-        "away_away_win_pct": away_away_win_pct,
-        "ppg_diff": ppg_diff,
-        "oppg_diff": oppg_diff,
-        "home_net_rating": home_net_rating,
-        "away_net_rating": away_net_rating,
-        "net_rating_diff": net_rating_diff,
-        "win_pct_diff": win_pct_diff,
-        "expected_total": expected_total,
-        "ou_line": ou_line,
-        "ht_ou_line": ht_ou_line,
-    }
-    X = np.column_stack([col_data[c] for c in FEATURE_COLUMNS])
-
-    # --- labels --------------------------------------------------------
-    # Winner: home team wins ~58% of the time; net rating + 2 home advantage
-    home_advantage = 2.0
-    noise = rng.normal(0, 5, n_samples)
-    y_winner = ((home_net_rating + home_advantage) > (away_net_rating + noise)).astype(int)
-
-    # Full-time O/U: actual total drawn from normal around expected_total
-    actual_total = rng.normal(expected_total, 15, n_samples)
-    y_ft_ou = (actual_total > ou_line).astype(int)
-
-    # Halftime O/U: actual HT total roughly half of FT total with some spread
-    actual_ht_total = rng.normal(expected_total / 2, 8, n_samples)
-    y_ht_ou = (actual_ht_total > ht_ou_line).astype(int)
-
-    return X, y_winner, y_ft_ou, y_ht_ou
+XGB_PARAMS = {
+    "n_estimators": 300,
+    "max_depth": 4,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "eval_metric": "logloss",
+    "random_state": RNG_SEED,
+    "verbosity": 0,
+}
 
 
-# ---------------------------------------------------------------------------
-# DB data loader
-# ---------------------------------------------------------------------------
+@dataclass
+class GameRecord:
+    date: datetime
+    season: str
+    home_id: str
+    away_id: str
+    home_score: int
+    away_score: int
+    ou_line: float | None = None
 
-async def _load_db_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    """
-    Attempt to load training data from the application database.
 
-    Returns the same (X, y_winner, y_ft_ou, y_ht_ou) tuple as the synthetic
-    generator, or ``None`` when there are insufficient finished games.
-    """
-    try:
-        from sqlalchemy import select
-        from app.db.session import AsyncSessionLocal
-        from app.db.models import Game, TeamStats, Prediction
-    except ImportError as exc:
-        print(f"[train] DB import failed ({exc}); will use synthetic data.")
-        return None
+@dataclass
+class TeamForm:
+    games: int = 0
+    wins: int = 0
+    points_for: int = 0
+    points_against: int = 0
+    home_games: int = 0
+    home_wins: int = 0
+    away_games: int = 0
+    away_wins: int = 0
 
-    async with AsyncSessionLocal() as db:
-        # Fetch all finished games with both scores recorded
-        result = await db.execute(
-            select(Game).where(
-                Game.status == "finished",
-                Game.home_score.is_not(None),
-                Game.away_score.is_not(None),
-            )
-        )
-        games: list[Game] = list(result.scalars().all())
 
-    if len(games) < MIN_REAL_GAMES:
-        print(
-            f"[train] Only {len(games)} finished games found "
-            f"(need {MIN_REAL_GAMES}). Falling back to synthetic data."
-        )
-        return None
+def _read_totals() -> dict[str, float]:
+    path = KAGGLE_DIR / "nba_betting_totals.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Kaggle totals file is missing: {path}")
 
-    print(f"[train] Loaded {len(games)} finished games from DB.")
-
-    from app.ml.features import build_feature_vector
-
-    rows: list[list[float]] = []
-    y_winner_list: list[int] = []
-    y_ft_ou_list: list[int] = []
-    y_ht_ou_list: list[int] = []
-
-    async with AsyncSessionLocal() as db:
-        for game in games:
-            # O/U targets require sportsbook lines and actual halftime scores.
-            # Missing values must not be mislabeled as an Under result.
-            if any(
-                value is None
-                for value in (
-                    game.ou_line,
-                    game.ht_ou_line,
-                    game.home_halftime_score,
-                    game.away_halftime_score,
+    by_game: dict[str, list[float]] = defaultdict(list)
+    with path.open(encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                # Usually total1 == total2; average both sides for the few
+                # records where the source has a small discrepancy.
+                by_game[row["game_id"]].append(
+                    (float(row["total1"]) + float(row["total2"])) / 2
                 )
-            ):
+            except (KeyError, TypeError, ValueError):
                 continue
-
-            fv = await build_feature_vector(db, game)
-            if fv is None:
-                continue  # missing stats — skip
-
-            row = [fv[c] for c in FEATURE_COLUMNS]
-            rows.append(row)
-
-            # Winner label
-            y_winner_list.append(1 if game.home_score > game.away_score else 0)
-
-            # Full-time O/U label
-            actual_total = game.home_score + game.away_score
-            y_ft_ou_list.append(1 if actual_total > game.ou_line else 0)
-
-            # Halftime O/U label
-            ht_total = game.home_halftime_score + game.away_halftime_score
-            y_ht_ou_list.append(1 if ht_total > game.ht_ou_line else 0)
-
-    if len(rows) < MIN_REAL_GAMES:
-        print(
-            f"[train] Only {len(rows)} usable feature vectors after filtering. "
-            "Falling back to synthetic data."
-        )
-        return None
-
-    X = np.array(rows, dtype=float)
-    return (
-        X,
-        np.array(y_winner_list, dtype=int),
-        np.array(y_ft_ou_list, dtype=int),
-        np.array(y_ht_ou_list, dtype=int),
-    )
+    return {game_id: float(statistics.median(lines)) for game_id, lines in by_game.items()}
 
 
-# ---------------------------------------------------------------------------
-# Training helpers
-# ---------------------------------------------------------------------------
+def _read_kaggle_games(totals: dict[str, float]) -> list[GameRecord]:
+    path = KAGGLE_DIR / "nba_games_all.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Kaggle game file is missing: {path}")
 
-def _train_classifier(
-    name: str,
-    X_train: np.ndarray,
-    X_test: np.ndarray,
-    y_train: np.ndarray,
-    y_test: np.ndarray,
-) -> tuple[XGBClassifier, float]:
-    """Train a single XGBClassifier and return (model, test_accuracy)."""
-    print(f"[train] Training {name} …")
+    by_game: dict[str, list[dict[str, str]]] = defaultdict(list)
+    with path.open(encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("season_type") != "Regular Season" or not row.get("game_date"):
+                continue
+            by_game[row["game_id"]].append(row)
+
+    records: list[GameRecord] = []
+    for game_id, rows in by_game.items():
+        if len(rows) != 2:
+            continue
+        home = next((row for row in rows if row.get("is_home", "").lower() == "t"), None)
+        away = next((row for row in rows if row.get("is_home", "").lower() == "f"), None)
+        if home is None or away is None:
+            continue
+        try:
+            records.append(
+                GameRecord(
+                    date=datetime.fromisoformat(home["game_date"]),
+                    season=home.get("season") or "unknown",
+                    home_id=home["team_id"],
+                    away_id=away["team_id"],
+                    home_score=int(home["pts"]),
+                    away_score=int(away["pts"]),
+                    ou_line=totals.get(game_id),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return records
+
+
+def _read_api_sports_games() -> list[GameRecord]:
+    if not API_SPORTS_FILE.exists():
+        raise FileNotFoundError(f"API-Sports historical file is missing: {API_SPORTS_FILE}")
+
+    records: list[GameRecord] = []
+    with API_SPORTS_FILE.open(encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("status") not in {"FT", "AOT", "POST"}:
+                continue
+            try:
+                records.append(
+                    GameRecord(
+                        # Normalize timestamps so they sort alongside Kaggle's
+                        # date-only values without mixing aware/naive objects.
+                        date=datetime.fromisoformat(row["date"]).replace(tzinfo=None),
+                        season=row["season"],
+                        home_id=row["home_team_id"],
+                        away_id=row["away_team_id"],
+                        home_score=int(row["home_score"]),
+                        away_score=int(row["away_score"]),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+    return records
+
+
+def _features_for_records(
+    records: list[GameRecord],
+) -> tuple[list[list[float]], list[int], list[list[float]], list[int]]:
+    """Build leak-safe pregame rolling stats and head-specific samples."""
+    forms: dict[tuple[str, str], TeamForm] = defaultdict(TeamForm)
+    winner_x: list[list[float]] = []
+    winner_y: list[int] = []
+    totals_x: list[list[float]] = []
+    totals_y: list[int] = []
+
+    for game in sorted(records, key=lambda item: (item.date, item.season, item.home_id)):
+        home = forms[(game.season, game.home_id)]
+        away = forms[(game.season, game.away_id)]
+
+        home_ppg = home.points_for / home.games if home.games else BASELINE_PPG
+        home_oppg = home.points_against / home.games if home.games else BASELINE_PPG
+        away_ppg = away.points_for / away.games if away.games else BASELINE_PPG
+        away_oppg = away.points_against / away.games if away.games else BASELINE_PPG
+        home_win_pct = home.wins / home.games if home.games else 0.5
+        home_home_win_pct = home.home_wins / home.home_games if home.home_games else 0.5
+        away_win_pct = away.wins / away.games if away.games else 0.5
+        away_away_win_pct = away.away_wins / away.away_games if away.away_games else 0.5
+
+        expected_total = home_ppg + away_ppg
+        values = {
+            "home_ppg": home_ppg,
+            "home_oppg": home_oppg,
+            "home_win_pct": home_win_pct,
+            "home_home_win_pct": home_home_win_pct,
+            "away_ppg": away_ppg,
+            "away_oppg": away_oppg,
+            "away_win_pct": away_win_pct,
+            "away_away_win_pct": away_away_win_pct,
+            "ppg_diff": home_ppg - away_ppg,
+            "oppg_diff": home_oppg - away_oppg,
+            "home_net_rating": home_ppg - home_oppg,
+            "away_net_rating": away_ppg - away_oppg,
+            "net_rating_diff": (home_ppg - home_oppg) - (away_ppg - away_oppg),
+            "win_pct_diff": home_win_pct - away_win_pct,
+            "expected_total": expected_total,
+            "ou_line": game.ou_line if game.ou_line is not None else 0.0,
+            "ht_ou_line": 0.0,
+        }
+        winner_x.append([float(values[name]) for name in WINNER_FEATURES])
+        winner_y.append(int(game.home_score > game.away_score))
+
+        if game.ou_line is not None and game.home_score + game.away_score != game.ou_line:
+            totals_x.append([float(values[name]) for name in FT_OU_FEATURES])
+            totals_y.append(int(game.home_score + game.away_score > game.ou_line))
+
+        home.games += 1
+        away.games += 1
+        home.points_for += game.home_score
+        home.points_against += game.away_score
+        away.points_for += game.away_score
+        away.points_against += game.home_score
+        if game.home_score > game.away_score:
+            home.wins += 1
+            home.home_wins += 1
+        else:
+            away.wins += 1
+            away.away_wins += 1
+        home.home_games += 1
+        away.away_games += 1
+
+    return winner_x, winner_y, totals_x, totals_y
+
+
+def _fit_temporal(name: str, X: list[list[float]], y: list[int]) -> tuple[XGBClassifier, float]:
+    if len(y) < MIN_TRAINING_ROWS:
+        raise RuntimeError(f"Only {len(y)} real rows are available for {name}; need {MIN_TRAINING_ROWS}.")
+    split = int(len(y) * 0.8)
+    if split < MIN_TRAINING_ROWS or len(set(y[:split])) < 2 or len(set(y[split:])) < 2:
+        raise RuntimeError(f"Not enough examples from both classes for chronological {name} evaluation.")
     model = XGBClassifier(**XGB_PARAMS)
-    model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_test, y_test)],
-        verbose=False,
-    )
-    preds = model.predict(X_test)
-    acc = accuracy_score(y_test, preds)
-    print(f"[train] {name} accuracy: {acc:.4f} ({acc * 100:.1f}%)")
-    return model, acc
+    model.fit(np.asarray(X[:split]), np.asarray(y[:split]), verbose=False)
+    accuracy = float(accuracy_score(y[split:], model.predict(np.asarray(X[split:]))))
+    print(f"[train] {name}: {len(y)} real samples, chronological holdout accuracy {accuracy:.3f}")
+    return model, accuracy
 
 
 def _save_model(model: XGBClassifier, filename: str) -> None:
-    """Save model to the models directory using XGBoost's native JSON format."""
-    path = MODELS_DIR / filename
-    model.save_model(str(path))
-    print(f"[train] Saved {path}")
-
-
-def _save_metadata(
-    winner_acc: float,
-    ft_ou_acc: float,
-    ht_ou_acc: float,
-    source: str,
-) -> None:
-    """Write training metadata to models/metadata.json."""
-    meta = {
-        "version": "1.0.0",
-        "trained_at": datetime.now(timezone.utc).isoformat(),
-        "data_source": source,
-        "feature_columns": FEATURE_COLUMNS,
-        "winner_accuracy": round(winner_acc * 100, 2),
-        "ft_ou_accuracy": round(ft_ou_acc * 100, 2),
-        "ht_ou_accuracy": round(ht_ou_acc * 100, 2),
-    }
-    meta_path = MODELS_DIR / "metadata.json"
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-    print(f"[train] Metadata saved to {meta_path}")
-
-
-# ---------------------------------------------------------------------------
-# Main training routine
-# ---------------------------------------------------------------------------
-
-async def main() -> None:
-    print("[train] 5Star Predictions — Model Training")
-    print(f"[train] Models will be written to: {MODELS_DIR}")
-
-    # ------------------------------------------------------------------
-    # 1. Acquire data
-    # ------------------------------------------------------------------
-    data = await _load_db_data()
-    if data is None:
-        print("[train] Generating synthetic training data …")
-        data = _generate_synthetic_data(n_samples=2000)
-        data_source = "synthetic"
-    else:
-        data_source = "database"
-
-    X, y_winner, y_ft_ou, y_ht_ou = data
-    print(f"[train] Dataset size: {X.shape[0]} samples, {X.shape[1]} features")
-
-    # ------------------------------------------------------------------
-    # 2. Train/test split (80 / 20)
-    # ------------------------------------------------------------------
-    X_tr, X_te, yw_tr, yw_te = train_test_split(
-        X, y_winner, test_size=0.2, random_state=RNG_SEED, stratify=y_winner
-    )
-    _, _, yf_tr, yf_te = train_test_split(
-        X, y_ft_ou, test_size=0.2, random_state=RNG_SEED, stratify=y_ft_ou
-    )
-    _, _, yh_tr, yh_te = train_test_split(
-        X, y_ht_ou, test_size=0.2, random_state=RNG_SEED, stratify=y_ht_ou
-    )
-
-    # ------------------------------------------------------------------
-    # 3. Train all three models
-    # ------------------------------------------------------------------
-    winner_model, winner_acc = _train_classifier(
-        "winner_model", X_tr, X_te, yw_tr, yw_te
-    )
-    ft_ou_model, ft_ou_acc = _train_classifier(
-        "ft_ou_model", X_tr, X_te, yf_tr, yf_te
-    )
-    ht_ou_model, ht_ou_acc = _train_classifier(
-        "ht_ou_model", X_tr, X_te, yh_tr, yh_te
-    )
-
-    # ------------------------------------------------------------------
-    # 4. Persist models and metadata
-    # ------------------------------------------------------------------
-    _save_model(winner_model, "winner_model.json")
-    _save_model(ft_ou_model, "ft_ou_model.json")
-    _save_model(ht_ou_model, "ht_ou_model.json")
-    _save_metadata(winner_acc, ft_ou_acc, ht_ou_acc, data_source)
-
-    print("\n[train] Training complete.")
-    print(f"  Winner model accuracy : {winner_acc * 100:.1f}%")
-    print(f"  FT O/U model accuracy : {ft_ou_acc * 100:.1f}%")
-    print(f"  HT O/U model accuracy : {ht_ou_acc * 100:.1f}%")
+    model.save_model(str(MODELS_DIR / filename))
+    print(f"[train] Saved {MODELS_DIR / filename}")
 
 
 async def run_training() -> None:
     """Entry point used by the monthly scheduler."""
-    await main()
+    await train_real_data()
+
+
+async def train_real_data() -> None:
+    print("[train] Loading real Kaggle and API-Sports game results")
+    totals = _read_totals()
+    kaggle_games = sorted(_read_kaggle_games(totals), key=lambda item: (item.date, item.season))
+    api_games = sorted(_read_api_sports_games(), key=lambda item: (item.date, item.season))
+    print(
+        f"[train] Kaggle: {len(kaggle_games)} regular-season results, "
+        f"{sum(game.ou_line is not None for game in kaggle_games)} with full-game totals; "
+        f"API-Sports: {len(api_games)} completed results"
+    )
+
+    # Build each source independently so a team's historical form never
+    # crosses datasets or season boundaries.
+    kaggle_wx, kaggle_wy, ft_x, ft_y = _features_for_records(kaggle_games)
+    api_wx, api_wy, _, _ = _features_for_records(api_games)
+
+    winner_pairs = sorted(
+        zip(kaggle_games, kaggle_wx, kaggle_wy), key=lambda row: (row[0].date, row[0].season)
+    ) + sorted(zip(api_games, api_wx, api_wy), key=lambda row: (row[0].date, row[0].season))
+    winner_pairs.sort(key=lambda row: (row[0].date, row[0].season))
+    winner_x = [row[1] for row in winner_pairs]
+    winner_y = [row[2] for row in winner_pairs]
+
+    winner_model, winner_accuracy = _fit_temporal("winner_model", winner_x, winner_y)
+    ft_model, ft_accuracy = _fit_temporal("ft_ou_model", ft_x, ft_y)
+    _save_model(winner_model, "winner_model.json")
+    _save_model(ft_model, "ft_ou_model.json")
+
+    metadata = {
+        "version": "2.0.0",
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "data_source": "real_historical",
+        "models": {
+            "winner_model": {
+                "data_source": "Kaggle NBA game results + API-Sports 2022-2025",
+                "samples": len(winner_y),
+                "feature_columns": WINNER_FEATURES,
+                "holdout_method": "chronological last 20%",
+                "holdout_accuracy": round(winner_accuracy * 100, 2),
+            },
+            "ft_ou_model": {
+                "data_source": "Kaggle median sportsbook full-game totals",
+                "samples": len(ft_y),
+                "feature_columns": FT_OU_FEATURES,
+                "holdout_method": "chronological last 20%",
+                "holdout_accuracy": round(ft_accuracy * 100, 2),
+            },
+            "ht_ou_model": {
+                "data_source": "legacy synthetic model; no verified historical first-half lines available",
+                "validated": False,
+                "feature_columns": FEATURE_COLUMNS,
+            },
+        },
+    }
+    (MODELS_DIR / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print("[train] Updated winner and full-game totals models with real data.")
+    print("[train] Halftime totals model remains legacy and unvalidated: no first-half lines in Kaggle data.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(train_real_data())

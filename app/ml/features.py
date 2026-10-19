@@ -42,6 +42,11 @@ FEATURE_COLUMNS: list[str] = [
     "ht_ou_line",
 ]
 
+# Head-specific inputs match what the corresponding historical sources contain.
+WINNER_FEATURE_COLUMNS: list[str] = FEATURE_COLUMNS[:15]
+FT_OU_FEATURE_COLUMNS: list[str] = FEATURE_COLUMNS[:16]
+HT_OU_FEATURE_COLUMNS: list[str] = FEATURE_COLUMNS
+
 
 # ---------------------------------------------------------------------------
 # DB helper

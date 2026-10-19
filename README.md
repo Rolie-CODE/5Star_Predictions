@@ -23,7 +23,18 @@ cp .env.example .env
 ```bash
 python -m app.ml.train
 ```
-This generates `app/ml/models/winner_model.json`, `ft_ou_model.json`, `ht_ou_model.json`.
+Training reads `data/kaggle_nba/nba_games_all.csv`,
+`data/kaggle_nba/nba_betting_totals.csv`, and
+`data/api_sports_nba_historical_2022_2025.csv`. The Kaggle files are available
+from [NBA Historical Stats and Betting Data](https://www.kaggle.com/datasets/ehallmar/nba-historical-stats-and-betting-data).
+The dataset page lists its license as unknown; check the current license before
+redistributing the files.
+
+The winner model trains on real historical results. The full-game over/under
+model trains on Kaggle games with sportsbook totals. The Kaggle totals file has
+no first-half lines, so training leaves the legacy halftime model untouched and
+marks it unvalidated in `app/ml/models/metadata.json`. Its predictions should
+not be treated as validated picks.
 
 ### 4. Run the server
 ```bash

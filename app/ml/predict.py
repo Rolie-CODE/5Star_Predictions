@@ -22,7 +22,11 @@ from pathlib import Path
 import numpy as np
 from xgboost import XGBClassifier
 
-from app.ml.features import FEATURE_COLUMNS
+from app.ml.features import (
+    FT_OU_FEATURE_COLUMNS,
+    HT_OU_FEATURE_COLUMNS,
+    WINNER_FEATURE_COLUMNS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -200,20 +204,19 @@ class PredictionEngine:
         # Build the input matrix in the exact column order required by models
         # ------------------------------------------------------------------
         try:
-            row = [float(feature_dict[col]) for col in FEATURE_COLUMNS]
+            winner_X = np.array([[float(feature_dict[col]) for col in WINNER_FEATURE_COLUMNS]])
+            ft_ou_X = np.array([[float(feature_dict[col]) for col in FT_OU_FEATURE_COLUMNS]])
+            ht_ou_X = np.array([[float(feature_dict[col]) for col in HT_OU_FEATURE_COLUMNS]])
         except KeyError as exc:
             raise KeyError(
                 f"Missing feature column in feature_dict: {exc}. "
-                f"Required columns: {FEATURE_COLUMNS}"
+                "Required columns: all model feature columns."
             ) from exc
-
-        # Shape: (1, n_features) — XGBoost expects a 2-D array.
-        X = np.array([row], dtype=float)
 
         # ------------------------------------------------------------------
         # Winner model
         # ------------------------------------------------------------------
-        winner_proba = self._loader.winner_model.predict_proba(X)[0]
+        winner_proba = self._loader.winner_model.predict_proba(winner_X)[0]
         winner_class = int(np.argmax(winner_proba))
         winner_pick = "Home" if winner_class == 1 else "Away"
         # Trust = probability of the predicted class
@@ -222,7 +225,7 @@ class PredictionEngine:
         # ------------------------------------------------------------------
         # Full-time O/U model
         # ------------------------------------------------------------------
-        ft_ou_proba = self._loader.ft_ou_model.predict_proba(X)[0]
+        ft_ou_proba = self._loader.ft_ou_model.predict_proba(ft_ou_X)[0]
         ft_ou_class = int(np.argmax(ft_ou_proba))
         ft_ou_pick = "Over" if ft_ou_class == 1 else "Under"
         ft_ou_trust = round(float(ft_ou_proba[ft_ou_class]) * 100, 1)
@@ -230,7 +233,7 @@ class PredictionEngine:
         # ------------------------------------------------------------------
         # Halftime O/U model
         # ------------------------------------------------------------------
-        ht_ou_proba = self._loader.ht_ou_model.predict_proba(X)[0]
+        ht_ou_proba = self._loader.ht_ou_model.predict_proba(ht_ou_X)[0]
         ht_ou_class = int(np.argmax(ht_ou_proba))
         ht_ou_pick = "Over" if ht_ou_class == 1 else "Under"
         ht_ou_trust = round(float(ht_ou_proba[ht_ou_class]) * 100, 1)
