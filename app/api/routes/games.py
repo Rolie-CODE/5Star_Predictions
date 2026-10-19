@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import GameResponse
 from app.db.session import get_db  # async session dependency
+from app.ingestion.data_pipeline import sync_todays_games
 from app.services import prediction_service
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,10 @@ async def get_today_games(db: DBSession) -> list[GameResponse]:
     has not yet been computed will have `prediction: null` in the response.
     """
     try:
+        # The games screen can be opened before the background job runs (or
+        # when that job was missed). Refresh today's fixtures before querying
+        # the database so newly published/preseason games are discoverable.
+        await sync_todays_games(db)
         game_dicts = await prediction_service.get_todays_games_with_predictions(db)
     except Exception:
         logger.exception("Error fetching today's games.")

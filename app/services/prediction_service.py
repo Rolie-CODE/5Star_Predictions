@@ -64,12 +64,12 @@ def _game_to_dict(game: Game, prediction: Prediction | None) -> dict:
             },
             "full_time_ou": {
                 "pick": prediction.ft_ou_pick,
-                "line": prediction.ft_ou_line,
+                "line": game.ou_line,
                 "trust": prediction.ft_ou_trust,
             },
             "half_time_ou": {
                 "pick": prediction.ht_ou_pick,
-                "line": prediction.ht_ou_line,
+                "line": game.ht_ou_line,
                 "trust": prediction.ht_ou_trust,
             },
         }
@@ -177,9 +177,8 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
             # -- 3. Run ML models -----------------------------------------
             result_payload: dict = prediction_engine.predict(features)
             # Expected keys in result_payload:
-            #   winner_pick, winner_trust,
-            #   ft_ou_pick, ft_ou_line, ft_ou_trust,
-            #   ht_ou_pick, ht_ou_line, ht_ou_trust
+            #   winner_pick, winner_trust, ft_ou_pick, ft_ou_trust,
+            #   ht_ou_pick, ht_ou_trust, model_version
 
             # -- 4. Upsert Prediction row ----------------------------------
             existing_stmt = select(Prediction).where(
@@ -197,12 +196,10 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
                         winner_pick=result_payload["winner_pick"],
                         winner_trust=result_payload["winner_trust"],
                         ft_ou_pick=result_payload["ft_ou_pick"],
-                        ft_ou_line=result_payload.get("ft_ou_line"),
                         ft_ou_trust=result_payload["ft_ou_trust"],
                         ht_ou_pick=result_payload["ht_ou_pick"],
-                        ht_ou_line=result_payload.get("ht_ou_line"),
                         ht_ou_trust=result_payload["ht_ou_trust"],
-                        updated_at=_utc_now(),
+                        model_version=result_payload["model_version"],
                     )
                 )
             else:
@@ -211,13 +208,11 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
                     winner_pick=result_payload["winner_pick"],
                     winner_trust=result_payload["winner_trust"],
                     ft_ou_pick=result_payload["ft_ou_pick"],
-                    ft_ou_line=result_payload.get("ft_ou_line"),
                     ft_ou_trust=result_payload["ft_ou_trust"],
                     ht_ou_pick=result_payload["ht_ou_pick"],
-                    ht_ou_line=result_payload.get("ht_ou_line"),
                     ht_ou_trust=result_payload["ht_ou_trust"],
+                    model_version=result_payload["model_version"],
                     created_at=_utc_now(),
-                    updated_at=_utc_now(),
                 )
                 db.add(new_prediction)
 

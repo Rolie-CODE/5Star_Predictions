@@ -48,8 +48,8 @@ class Settings(BaseSettings):
     NBA_LEAGUE_ID: int = 12
     """API-Sports internal ID for the NBA league."""
 
-    NBA_SEASON: str = "2025-2026"
-    """Active NBA season string as expected by the API (e.g. '2025-2026')."""
+    NBA_SEASON: str = "2026-2027"
+    """Active NBA season string as expected by the API (e.g. '2026-2027')."""
 
     # ------------------------------------------------------------------ #
     # Prediction display

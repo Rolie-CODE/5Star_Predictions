@@ -203,6 +203,19 @@ async def _load_db_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarra
 
     async with AsyncSessionLocal() as db:
         for game in games:
+            # O/U targets require sportsbook lines and actual halftime scores.
+            # Missing values must not be mislabeled as an Under result.
+            if any(
+                value is None
+                for value in (
+                    game.ou_line,
+                    game.ht_ou_line,
+                    game.home_halftime_score,
+                    game.away_halftime_score,
+                )
+            ):
+                continue
+
             fv = await build_feature_vector(db, game)
             if fv is None:
                 continue  # missing stats — skip
@@ -215,15 +228,11 @@ async def _load_db_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarra
 
             # Full-time O/U label
             actual_total = game.home_score + game.away_score
-            ou = float(game.ou_line) if game.ou_line is not None else 0.0
-            y_ft_ou_list.append(1 if (ou > 0 and actual_total > ou) else 0)
+            y_ft_ou_list.append(1 if actual_total > game.ou_line else 0)
 
             # Halftime O/U label
-            ht_total = (
-                (game.home_ht_score or 0) + (game.away_ht_score or 0)
-            )
-            ht_ou = float(game.ht_ou_line) if game.ht_ou_line is not None else 0.0
-            y_ht_ou_list.append(1 if (ht_ou > 0 and ht_total > ht_ou) else 0)
+            ht_total = game.home_halftime_score + game.away_halftime_score
+            y_ht_ou_list.append(1 if ht_total > game.ht_ou_line else 0)
 
     if len(rows) < MIN_REAL_GAMES:
         print(
@@ -352,10 +361,15 @@ async def main() -> None:
     _save_model(ht_ou_model, "ht_ou_model.json")
     _save_metadata(winner_acc, ft_ou_acc, ht_ou_acc, data_source)
 
-    print("\n[train] ✅ Training complete.")
+    print("\n[train] Training complete.")
     print(f"  Winner model accuracy : {winner_acc * 100:.1f}%")
     print(f"  FT O/U model accuracy : {ft_ou_acc * 100:.1f}%")
     print(f"  HT O/U model accuracy : {ht_ou_acc * 100:.1f}%")
+
+
+async def run_training() -> None:
+    """Entry point used by the monthly scheduler."""
+    await main()
 
 
 if __name__ == "__main__":

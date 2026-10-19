@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import TopPickItem, TopPicksResponse
 from app.db.session import get_db  # async session dependency
+from app.ingestion.data_pipeline import sync_all_team_stats, sync_todays_games
 from app.services import prediction_service
 
 logger = logging.getLogger(__name__)
@@ -149,6 +150,8 @@ async def refresh_predictions(db: DBSession) -> dict:
         ``{"predictions_made": <int>}``
     """
     try:
+        await sync_todays_games(db)
+        await sync_all_team_stats(db)
         count = await prediction_service.run_predictions_for_today(db)
     except Exception:
         logger.exception("Error running prediction pipeline.")

@@ -62,6 +62,8 @@ async def job_retrain_model() -> None:
         import importlib
         train_module = importlib.import_module("app.ml.train")
         await train_module.run_training()          # train.py must expose run_training()
+        from app.ml.predict import load_models
+        load_models()
         logger.info("[Scheduler] Model retraining complete.")
     except Exception as exc:
         logger.exception(f"[Scheduler] Retrain job failed: {exc}")

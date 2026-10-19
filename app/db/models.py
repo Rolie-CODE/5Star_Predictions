@@ -353,6 +353,23 @@ class TeamStats(Base):
         comment="Timestamp of the last ingestion update (UTC).",
     )
 
+    @property
+    def win_pct(self) -> float:
+        """Season win rate as a fraction in [0, 1]."""
+        return self.wins / self.games_played if self.games_played else 0.0
+
+    @property
+    def home_win_pct(self) -> float:
+        """Home win rate as a fraction in [0, 1]."""
+        total = self.home_wins + self.home_losses
+        return self.home_wins / total if total else 0.0
+
+    @property
+    def away_win_pct(self) -> float:
+        """Away win rate as a fraction in [0, 1]."""
+        total = self.away_wins + self.away_losses
+        return self.away_wins / total if total else 0.0
+
     # ------------------------------------------------------------------ #
     # Relationships
     # ------------------------------------------------------------------ #
@@ -378,8 +395,7 @@ class Prediction(Base):
     Model-generated predictions for a single game.
 
     One prediction row per game (enforced by the unique constraint on
-    ``game_id``).  Trust values are floats in [0, 1] representing the
-    model's confidence in each pick.
+    ``game_id``). Trust values are confidence percentages in [0, 100].
     """
 
     __tablename__ = "predictions"
@@ -407,7 +423,7 @@ class Prediction(Base):
     winner_trust: Mapped[float] = mapped_column(
         Float,
         nullable=False,
-        comment="Model confidence for winner pick, in [0, 1].",
+        comment="Model confidence for winner pick, in [0, 100].",
     )
 
     # ------------------------------------------------------------------ #
@@ -422,7 +438,7 @@ class Prediction(Base):
     ft_ou_trust: Mapped[float] = mapped_column(
         Float,
         nullable=False,
-        comment="Model confidence for the full-game O/U pick, in [0, 1].",
+        comment="Model confidence for the full-game O/U pick, in [0, 100].",
     )
 
     # ------------------------------------------------------------------ #
@@ -437,7 +453,7 @@ class Prediction(Base):
     ht_ou_trust: Mapped[float] = mapped_column(
         Float,
         nullable=False,
-        comment="Model confidence for the first-half O/U pick, in [0, 1].",
+        comment="Model confidence for the first-half O/U pick, in [0, 100].",
     )
 
     # ------------------------------------------------------------------ #
