@@ -41,6 +41,28 @@ _METADATA_PATH = _MODELS_DIR / "metadata.json"
 
 
 # ---------------------------------------------------------------------------
+# Calibration
+# ---------------------------------------------------------------------------
+
+class Calibrator:
+    """
+    Piecewise-linear isotonic map from raw model probability to calibrated
+    probability, fitted on a held-out split by train.py.  An empty map
+    leaves probabilities unchanged.
+    """
+
+    def __init__(self, spec: dict | None) -> None:
+        spec = spec or {}
+        self._x = np.asarray(spec.get("x", []), dtype=float)
+        self._y = np.asarray(spec.get("y", []), dtype=float)
+
+    def __call__(self, p: float) -> float:
+        if self._x.size == 0:
+            return p
+        return float(np.interp(p, self._x, self._y))
+
+
+# ---------------------------------------------------------------------------
 # ModelLoader
 # ---------------------------------------------------------------------------
 
@@ -48,15 +70,16 @@ class ModelLoader:
     """
     Responsible for loading XGBoost model files from disk.
 
-    All three models are loaded into memory via ``load()``.  The
-    ``is_loaded`` property can be used to guard inference calls at
-    application startup.
+    The winner and full-time O/U models are required.  The half-time model
+    is loaded only when metadata marks it as validated, so an unvalidated
+    model is never served.
     """
 
     def __init__(self) -> None:
         self._winner_model: XGBClassifier | None = None
         self._ft_ou_model: XGBClassifier | None = None
         self._ht_ou_model: XGBClassifier | None = None
+        self._calibrators: dict[str, Calibrator] = {}
         self._metadata: dict = {}
         self._loaded: bool = False
 
@@ -66,47 +89,56 @@ class ModelLoader:
 
     def load(self) -> None:
         """
-        Load all three XGBoost models from ``app/ml/models/``.
+        Load the models from ``app/ml/models/``.
 
         Raises
         ------
         FileNotFoundError
-            If any model file does not exist.  Run ``python -m app.ml.train``
-            first to produce the model artefacts.
+            If a required model file does not exist.  Run
+            ``python -m app.ml.train`` first to produce the model artefacts.
         """
-        for path in (_WINNER_MODEL_PATH, _FT_OU_MODEL_PATH, _HT_OU_MODEL_PATH):
+        for path in (_WINNER_MODEL_PATH, _FT_OU_MODEL_PATH):
             if not path.exists():
                 raise FileNotFoundError(
                     f"Model file not found: {path}\n"
                     "Run `python -m app.ml.train` to produce model artefacts."
                 )
 
-        logger.info("Loading winner_model …")
-        self._winner_model = XGBClassifier()
-        self._winner_model.load_model(str(_WINNER_MODEL_PATH))
-
-        logger.info("Loading ft_ou_model …")
-        self._ft_ou_model = XGBClassifier()
-        self._ft_ou_model.load_model(str(_FT_OU_MODEL_PATH))
-
-        logger.info("Loading ht_ou_model …")
-        self._ht_ou_model = XGBClassifier()
-        self._ht_ou_model.load_model(str(_HT_OU_MODEL_PATH))
-
-        # Load optional metadata (version info, accuracy stats)
+        metadata: dict = {}
         if _METADATA_PATH.exists():
-            with open(_METADATA_PATH, encoding="utf-8") as f:
-                self._metadata = json.load(f)
+            metadata = json.loads(_METADATA_PATH.read_text(encoding="utf-8"))
             logger.info(
                 "Model metadata: version=%s trained_at=%s",
-                self._metadata.get("version"),
-                self._metadata.get("trained_at"),
+                metadata.get("version"),
+                metadata.get("trained_at"),
             )
         else:
             logger.warning("metadata.json not found; version info will be unavailable.")
+        model_meta: dict = metadata.get("models", {})
 
+        # Build everything first, then swap in, so a retrain that fails
+        # half-way never leaves a mix of old and new models.
+        winner_model = XGBClassifier()
+        winner_model.load_model(str(_WINNER_MODEL_PATH))
+        ft_ou_model = XGBClassifier()
+        ft_ou_model.load_model(str(_FT_OU_MODEL_PATH))
+
+        ht_ou_model: XGBClassifier | None = None
+        if model_meta.get("ht_ou_model", {}).get("validated") and _HT_OU_MODEL_PATH.exists():
+            ht_ou_model = XGBClassifier()
+            ht_ou_model.load_model(str(_HT_OU_MODEL_PATH))
+        else:
+            logger.info("Half-time O/U model is not validated; HT picks are disabled.")
+
+        self._winner_model = winner_model
+        self._ft_ou_model = ft_ou_model
+        self._ht_ou_model = ht_ou_model
+        self._calibrators = {
+            name: Calibrator(meta.get("calibration")) for name, meta in model_meta.items()
+        }
+        self._metadata = metadata
         self._loaded = True
-        logger.info("All models loaded successfully.")
+        logger.info("Models loaded successfully.")
 
     @property
     def is_loaded(self) -> bool:
@@ -128,9 +160,13 @@ class ModelLoader:
         return self._ft_ou_model  # type: ignore[return-value]
 
     @property
-    def ht_ou_model(self) -> XGBClassifier:
+    def ht_ou_model(self) -> XGBClassifier | None:
+        """The validated half-time model, or None when HT picks are disabled."""
         self._assert_loaded()
-        return self._ht_ou_model  # type: ignore[return-value]
+        return self._ht_ou_model
+
+    def calibrator(self, model_name: str) -> Calibrator:
+        return self._calibrators.get(model_name) or Calibrator(None)
 
     @property
     def model_version(self) -> str:
@@ -165,26 +201,42 @@ class PredictionEngine:
     def __init__(self, loader: ModelLoader) -> None:
         self._loader = loader
 
+    def _binary_pick(
+        self,
+        model: XGBClassifier,
+        model_name: str,
+        feature_dict: dict,
+        columns: list[str],
+        labels: tuple[str, str],
+    ) -> tuple[str, float]:
+        """Return (label, trust %) where labels = (class 0 label, class 1 label)."""
+        try:
+            X = np.array([[float(feature_dict[col]) for col in columns]])
+        except KeyError as exc:
+            raise KeyError(f"Missing feature column in feature_dict: {exc}.") from exc
+        raw_p1 = float(model.predict_proba(X)[0][1])
+        p1 = self._loader.calibrator(model_name)(raw_p1)
+        pick = labels[1] if p1 >= 0.5 else labels[0]
+        return pick, round(max(p1, 1.0 - p1) * 100, 1)
+
     def predict(self, feature_dict: dict) -> dict:
         """
-        Run all three models for the given feature dictionary.
+        Run the models for the given feature dictionary.
 
-        Parameters
-        ----------
-        feature_dict:
-            A flat ``{feature_name: value}`` dict.  Keys must cover at least
-            every column listed in ``FEATURE_COLUMNS``.  Extra keys are
-            silently ignored.
+        An O/U head is skipped (pick and trust are ``None``) when its
+        sportsbook line is missing, because the models were only trained on
+        games with a real line.  The half-time head is also skipped while
+        no validated half-time model is loaded.
 
         Returns
         -------
         dict with keys:
             winner_pick     : 'Home' | 'Away'
-            winner_trust    : float — confidence % (0–100)
-            ft_ou_pick      : 'Over' | 'Under'
-            ft_ou_trust     : float — confidence %
-            ht_ou_pick      : 'Over' | 'Under'
-            ht_ou_trust     : float — confidence %
+            winner_trust    : float — calibrated confidence % (50–100)
+            ft_ou_pick      : 'Over' | 'Under' | None
+            ft_ou_trust     : float | None
+            ht_ou_pick      : 'Over' | 'Under' | None
+            ht_ou_trust     : float | None
             model_version   : str
 
         Raises
@@ -200,43 +252,38 @@ class PredictionEngine:
                 "Ensure load_models() is called at application startup."
             )
 
-        # ------------------------------------------------------------------
-        # Build the input matrix in the exact column order required by models
-        # ------------------------------------------------------------------
-        try:
-            winner_X = np.array([[float(feature_dict[col]) for col in WINNER_FEATURE_COLUMNS]])
-            ft_ou_X = np.array([[float(feature_dict[col]) for col in FT_OU_FEATURE_COLUMNS]])
-            ht_ou_X = np.array([[float(feature_dict[col]) for col in HT_OU_FEATURE_COLUMNS]])
-        except KeyError as exc:
-            raise KeyError(
-                f"Missing feature column in feature_dict: {exc}. "
-                "Required columns: all model feature columns."
-            ) from exc
+        winner_pick, winner_trust = self._binary_pick(
+            self._loader.winner_model,
+            "winner_model",
+            feature_dict,
+            WINNER_FEATURE_COLUMNS,
+            ("Away", "Home"),
+        )
 
-        # ------------------------------------------------------------------
-        # Winner model
-        # ------------------------------------------------------------------
-        winner_proba = self._loader.winner_model.predict_proba(winner_X)[0]
-        winner_class = int(np.argmax(winner_proba))
-        winner_pick = "Home" if winner_class == 1 else "Away"
-        # Trust = probability of the predicted class
-        winner_trust = round(float(winner_proba[winner_class]) * 100, 1)
+        ft_ou_pick = ft_ou_trust = None
+        if feature_dict.get("ou_line") is not None:
+            ft_ou_pick, ft_ou_trust = self._binary_pick(
+                self._loader.ft_ou_model,
+                "ft_ou_model",
+                feature_dict,
+                FT_OU_FEATURE_COLUMNS,
+                ("Under", "Over"),
+            )
 
-        # ------------------------------------------------------------------
-        # Full-time O/U model
-        # ------------------------------------------------------------------
-        ft_ou_proba = self._loader.ft_ou_model.predict_proba(ft_ou_X)[0]
-        ft_ou_class = int(np.argmax(ft_ou_proba))
-        ft_ou_pick = "Over" if ft_ou_class == 1 else "Under"
-        ft_ou_trust = round(float(ft_ou_proba[ft_ou_class]) * 100, 1)
-
-        # ------------------------------------------------------------------
-        # Halftime O/U model
-        # ------------------------------------------------------------------
-        ht_ou_proba = self._loader.ht_ou_model.predict_proba(ht_ou_X)[0]
-        ht_ou_class = int(np.argmax(ht_ou_proba))
-        ht_ou_pick = "Over" if ht_ou_class == 1 else "Under"
-        ht_ou_trust = round(float(ht_ou_proba[ht_ou_class]) * 100, 1)
+        ht_ou_pick = ht_ou_trust = None
+        ht_model = self._loader.ht_ou_model
+        if (
+            ht_model is not None
+            and feature_dict.get("ou_line") is not None
+            and feature_dict.get("ht_ou_line") is not None
+        ):
+            ht_ou_pick, ht_ou_trust = self._binary_pick(
+                ht_model,
+                "ht_ou_model",
+                feature_dict,
+                HT_OU_FEATURE_COLUMNS,
+                ("Under", "Over"),
+            )
 
         return {
             "winner_pick": winner_pick,
@@ -266,18 +313,7 @@ prediction_engine = PredictionEngine(model_loader)
 
 def load_models() -> None:
     """
-    Load all XGBoost models into the shared ``model_loader`` singleton.
-
-    Call this from the FastAPI lifespan or startup event:
-
-    .. code-block:: python
-
-        from app.ml.predict import load_models
-
-        @asynccontextmanager
-        async def lifespan(app: FastAPI):
-            load_models()
-            yield
+    Load the XGBoost models into the shared ``model_loader`` singleton.
 
     Logs a warning (rather than raising) if model files are absent so that
     the API can still start in environments where training has not yet run.
@@ -287,7 +323,7 @@ def load_models() -> None:
         logger.info("5Star Predictions models are ready.")
     except FileNotFoundError as exc:
         logger.warning(
-            "⚠️  Could not load ML models: %s. "
+            "Could not load ML models: %s. "
             "Prediction endpoints will be unavailable until models are trained.",
             exc,
         )

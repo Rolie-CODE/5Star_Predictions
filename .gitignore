@@ -19,12 +19,11 @@ env/
 *.db-shm
 *.db-wal
 
-# Trained model files (large binaries — regenerate with `python -m app.ml.train`)
-app/ml/models/*.json
-!app/ml/models/.gitkeep
+# Training data (kept locally, not redistributed — see README)
+data/
 
-# Alembic (keep versions, ignore local env files)
-alembic.ini
+# Legacy synthetic half-time model (never served)
+app/ml/models/ht_ou_model.json
 
 # IDE
 .vscode/

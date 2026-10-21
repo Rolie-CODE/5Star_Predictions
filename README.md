@@ -1,6 +1,6 @@
 # 5Star Predictions
 
-Basketball prediction API built with FastAPI + XGBoost. Provides Home/Away winner predictions, Full-Time and Half-Time Over/Under predictions with trust percentages, and top daily picks.
+Basketball prediction API built with FastAPI + XGBoost. Provides Home/Away winner predictions and Full-Time Over/Under predictions with calibrated trust percentages, plus top daily picks.
 
 ---
 
@@ -10,37 +10,58 @@ Basketball prediction API built with FastAPI + XGBoost. Provides Home/Away winne
 ```bash
 git clone <your-repo>
 cd 5Star_Predictions
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # app + pytest; Python 3.14 (see .python-version)
 ```
 
 ### 2. Set up environment
 ```bash
 cp .env.example .env
-# Edit .env and add your API_SPORTS_KEY
+# Edit .env: add your API_SPORTS_KEY and an ADMIN_API_KEY
 ```
 
-### 3. Train the ML models (first time only)
+### 3. Models
+Trained models are committed in `app/ml/models/`, so the server runs without
+training anything. To retrain, you need the training data (see below):
 ```bash
-python -m app.ml.train
+python -m app.ml.train          # add --no-db to skip the app database
+git add app/ml/models && git commit -m "Retrain models"
 ```
-Training reads `data/kaggle_nba/nba_games_all.csv`,
-`data/kaggle_nba/nba_betting_totals.csv`, and
-`data/api_sports_nba_historical_2022_2025.csv`. The Kaggle files are available
-from [NBA Historical Stats and Betting Data](https://www.kaggle.com/datasets/ehallmar/nba-historical-stats-and-betting-data).
-The dataset page lists its license as unknown; check the current license before
-redistributing the files.
 
-The winner model trains on real historical results. The full-game over/under
-model trains on Kaggle games with sportsbook totals. The Kaggle totals file has
-no first-half lines, so training leaves the legacy halftime model untouched and
-marks it unvalidated in `app/ml/models/metadata.json`. Its predictions should
-not be treated as validated picks.
+**Training data is not in git.** Put these files in `data/` locally (the folder
+is gitignored):
+- `data/kaggle_nba/nba_games_all.csv` and `data/kaggle_nba/nba_betting_totals.csv` —
+  from [NBA Historical Stats and Betting Data](https://www.kaggle.com/datasets/ehallmar/nba-historical-stats-and-betting-data)
+  (license listed as unknown, so it isn't redistributed here)
+- `data/api_sports_nba_historical_2022_2025.csv` — exported from API-Sports with
+  your own key
+
+Training also uses every finished game the app has stored in its database
+(point `DATABASE_URL` at the production database to include those).
+
+Only regular-season games are used. Each model is fitted on the oldest 70% of
+games, calibrated on the next 15%, and scored on the newest 15%; the results
+are written to `app/ml/models/metadata.json`.
+
+| Model | Test accuracy | Notes |
+|-------|---------------|-------|
+| Winner | ~64.7% | Trust is a calibrated probability |
+| Full-time O/U | ~50.9% | **No measurable edge** over the sportsbook line |
+| Half-time O/U | — | Not served: no verified historical first-half lines |
+
+Picks are not betting advice; at standard -110 prices you need ~52.4% just to
+break even.
 
 ### 4. Run the server
 ```bash
 uvicorn app.main:app --reload
 ```
-API docs available at http://localhost:8000/docs
+Database migrations run automatically at startup. API docs available at
+http://localhost:8000/docs
+
+### 5. Run the tests
+```bash
+pytest
+```
 
 ---
 
@@ -48,26 +69,50 @@ API docs available at http://localhost:8000/docs
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Health check |
-| `GET` | `/games/today` | All games today with predictions |
+| `GET` | `/health` | Health check (`ok` or `degraded`) |
+| `GET` | `/games/today` | Today's slate (US Eastern day) with predictions |
 | `GET` | `/games/upcoming` | Games in the next 24 hours |
 | `GET` | `/games/{game_id}` | Single game + full prediction detail |
-| `GET` | `/predictions/top` | Top highest-trust picks of the day |
-| `POST` | `/predictions/refresh` | Manually trigger prediction refresh |
+| `GET` | `/predictions/top` | Top highest-trust picks |
+| `POST` | `/predictions/refresh` | Run the full pipeline now — requires `X-API-Key: <ADMIN_API_KEY>` |
+
+`full_time_ou` is `null` for games with no sportsbook line yet, and
+`half_time_ou` is always `null` until a validated half-time model exists.
 
 ### Query params for `/predictions/top`
 - `type` — `winner` (default), `ft_ou`, `ht_ou`
-- `limit` — number of picks (default 5, max 20)
+- `limit` — number of picks (default `TOP_PREDICTIONS_LIMIT`, max 20)
+
+---
+
+## Data source and API-Sports plan limits
+
+On the **Free** API-Sports plan:
+- Current-season queries (`league` + `season`) are rejected, so games are
+  fetched by date only (yesterday → tomorrow is allowed) and filtered to the NBA.
+- Odds are available; lines are the median main line across all bookmakers.
+- 100 requests/day and 10/minute. The client throttles itself to
+  `API_SPORTS_MAX_REQUESTS_PER_MINUTE`; the scheduled jobs use about 40/day.
+
+Team stats are computed from the finished games stored in the app's own
+database (same code as training). On the Free plan the database only knows the
+games synced since the app started, so start it at the beginning of the season
+and keep it running. A paid plan lets the app backfill the whole season in
+one request at startup.
 
 ---
 
 ## Scheduled Jobs
 
+Times are US Eastern (`LEAGUE_TIMEZONE`).
+
 | Job | Schedule | What it does |
 |-----|----------|--------------|
-| `fetch_and_predict` | Daily 07:00 | Syncs today's games + odds, runs predictions |
-| `fetch_results` | Every 2 hours | Updates finished game scores |
-| `retrain_model` | 1st of month, 03:00 | Retrains XGBoost models with latest data |
+| `catch_up` | At startup | Fills in anything missed while the server was down or asleep |
+| `fetch_and_predict` | Daily 10:00 and 17:00 | Syncs results, today's games + lines, team stats; runs predictions |
+| `fetch_results` | 19:00–03:00, every 2 hours | Updates scores (yesterday + today) and team stats |
+
+Models are retrained locally, not on the server (see step 3).
 
 ---
 
@@ -77,23 +122,39 @@ API docs available at http://localhost:8000/docs
 2. Connect repo in Render dashboard
 3. Render auto-detects `render.yaml` — click **Apply**
 4. Set `API_SPORTS_KEY` in Render → Environment Variables
-5. Done ✅
+   (`ADMIN_API_KEY` is generated for you; copy it from the dashboard)
+5. Set `CORS_ORIGINS` to your frontend's origin once you have one
+
+Free-plan notes:
+- The web service sleeps after ~15 minutes without traffic, which pauses the
+  scheduled jobs (`catch_up` runs when it wakes). To keep jobs on time, have a
+  free uptime service (e.g. cron-job.org) request `/health` every 10 minutes;
+  one always-on service fits in the free 750 hours/month.
+- Render's free databases expire — check their current limits. On the Free
+  API-Sports plan the database holds the only copy of this season's results,
+  so consider a non-expiring free Postgres (e.g. Neon or Supabase) and set its
+  URL as `DATABASE_URL` (see the comment in `render.yaml`).
 
 ---
 
-## Switching DB (SQLite → PostgreSQL)
+## Database
 
-The only change needed is the `DATABASE_URL` env var:
+`DATABASE_URL` selects the database:
 
 ```
 # Local (SQLite)
 DATABASE_URL=sqlite+aiosqlite:///./5star.db
 
-# Render (PostgreSQL)
-DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/dbname
+# PostgreSQL — postgres:// and postgresql:// URLs are switched to asyncpg automatically
+DATABASE_URL=postgresql://user:pass@host:5432/dbname
 ```
 
-`render.yaml` injects this automatically from the managed database.
+Schema changes are Alembic migrations in `migrations/versions/`. After
+changing `app/db/models.py`:
+
+```bash
+alembic revision --autogenerate -m "describe the change"
+```
 
 ---
 
@@ -107,15 +168,15 @@ app/
 │   └── scheduler.py         # APScheduler jobs
 ├── db/
 │   ├── models.py            # SQLAlchemy ORM models
-│   └── session.py           # Async engine + get_db dependency
+│   └── session.py           # Async engine, get_db dependency, migrations
 ├── ingestion/
-│   ├── api_sports.py        # API-Sports HTTP client
-│   └── data_pipeline.py     # Fetch → transform → persist
+│   ├── api_sports.py        # API-Sports HTTP client (throttled)
+│   └── data_pipeline.py     # Fetch → transform → persist, team stats
 ├── ml/
-│   ├── features.py          # Feature engineering
+│   ├── features.py          # Feature engineering shared by training + inference
 │   ├── train.py             # Training script
-│   ├── predict.py           # Inference engine
-│   └── models/              # Saved .json model files (gitignored except .gitkeep)
+│   ├── predict.py           # Inference engine + calibration
+│   └── models/              # Trained model files + metadata.json (committed)
 ├── services/
 │   └── prediction_service.py
 └── api/
@@ -123,4 +184,7 @@ app/
     └── routes/
         ├── games.py
         └── predictions.py
+migrations/                  # Alembic migrations
+tests/                       # pytest suite
+data/                        # Training data (local only, gitignored)
 ```
