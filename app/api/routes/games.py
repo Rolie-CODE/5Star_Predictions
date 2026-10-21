@@ -12,6 +12,7 @@ Prefix: /games
 from __future__ import annotations
 
 import logging
+import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -29,6 +30,10 @@ router = APIRouter(tags=["Games"])
 # Convenience type alias for the DB dependency
 DBSession = Annotated[AsyncSession, Depends(get_db)]
 
+# Minimum gap between fixture refreshes triggered by GET /games/today.
+_FIXTURE_SYNC_INTERVAL_SECONDS = 30 * 60
+_last_fixture_sync = float("-inf")
+
 
 # ---------------------------------------------------------------------------
 # GET /games/today
@@ -40,7 +45,8 @@ DBSession = Annotated[AsyncSession, Depends(get_db)]
     response_model=list[GameResponse],
     summary="Today's games with predictions",
     description=(
-        "Returns all games scheduled for today (midnight → midnight UTC) "
+        "Returns all games scheduled for today (midnight → midnight in the "
+        "league timezone, US Eastern by default) "
         "along with their model predictions, if available."
     ),
 )
@@ -51,11 +57,20 @@ async def get_today_games(db: DBSession) -> list[GameResponse]:
     Games are ordered by tip-off time ascending.  A game whose prediction
     has not yet been computed will have `prediction: null` in the response.
     """
+    # The games screen can be opened before the background job runs (or
+    # when that job was missed). Refresh today's fixtures at most once per
+    # interval — one API request, no odds — so page views can't drain the
+    # API-Sports quota.  A failed refresh still serves what the DB has.
+    global _last_fixture_sync
+    if time.monotonic() - _last_fixture_sync > _FIXTURE_SYNC_INTERVAL_SECONDS:
+        _last_fixture_sync = time.monotonic()
+        try:
+            await sync_todays_games(db, fetch_odds=False)
+        except Exception:
+            logger.exception("Fixture refresh failed; serving cached games.")
+            await db.rollback()
+
     try:
-        # The games screen can be opened before the background job runs (or
-        # when that job was missed). Refresh today's fixtures before querying
-        # the database so newly published/preseason games are discoverable.
-        await sync_todays_games(db)
         game_dicts = await prediction_service.get_todays_games_with_predictions(db)
     except Exception:
         logger.exception("Error fetching today's games.")

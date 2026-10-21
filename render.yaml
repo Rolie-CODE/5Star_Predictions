@@ -10,14 +10,22 @@ services:
     name: 5star-predictions-api
     runtime: python
     region: oregon          # Change to your preferred region
-    plan: free              # Upgrade to starter ($7/mo) for always-on
+    # Free instances sleep after ~15 minutes without traffic, which pauses
+    # the scheduled jobs (the app catches up when it wakes). Ping /health
+    # every 10 minutes from an uptime service to keep jobs on time.
+    plan: free
 
+    # Trained models are committed in app/ml/models/; retrain locally.
     buildCommand: pip install -r requirements.txt
+    # Migrations run automatically at startup (app.db.session.init_db).
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
     healthCheckPath: /health
 
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.14.6       # Keep in sync with .python-version
+
       - key: APP_ENV
         value: production
 
@@ -30,13 +38,25 @@ services:
       - key: NBA_LEAGUE_ID
         value: "12"
 
-      - key: NBA_SEASON
-        value: "2026-2027"
+      # NBA_SEASON is derived from the date; set it only to override.
+
+      # Protects POST /predictions/refresh (send it as the X-API-Key header).
+      - key: ADMIN_API_KEY
+        generateValue: true
+
+      # Comma-separated frontend origins, e.g. https://5star.example.com
+      - key: CORS_ORIGINS
+        value: "*"
 
       - key: TOP_PREDICTIONS_LIMIT
         value: "5"
 
-      # DATABASE_URL is injected automatically by the database block below
+      # Render provides a postgresql:// URL; the app switches it to asyncpg.
+      # Render's free databases expire (check their current limits), and on
+      # the Free API-Sports plan the database holds the only copy of this
+      # season's results. To use a non-expiring free Postgres (e.g. Neon or
+      # Supabase) instead, replace this block with `sync: false`, set the
+      # URL in the dashboard, and delete the databases section below.
       - key: DATABASE_URL
         fromDatabase:
           name: 5star-predictions-db
@@ -45,5 +65,5 @@ services:
 databases:
   - name: 5star-predictions-db
     databaseName: fivestar
-    plan: free              # Free tier lasts 90 days, then $7/mo
+    plan: free
     region: oregon

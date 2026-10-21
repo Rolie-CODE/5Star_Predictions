@@ -12,14 +12,15 @@ Prefix: /predictions
 from __future__ import annotations
 
 import logging
+import secrets
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import TopPickItem, TopPicksResponse
+from app.core.config import settings
 from app.db.session import get_db  # async session dependency
-from app.ingestion.data_pipeline import sync_all_team_stats, sync_todays_games
 from app.services import prediction_service
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,22 @@ DBSession = Annotated[AsyncSession, Depends(get_db)]
 # Valid values for the `type` query parameter
 _VALID_PREDICTION_TYPES = {"winner", "ft_ou", "ht_ou"}
 _MAX_LIMIT = 20
+
+
+def require_admin_key(
+    x_api_key: Annotated[str | None, Header(description="Value of ADMIN_API_KEY.")] = None,
+) -> None:
+    """Reject the request unless X-API-Key matches settings.ADMIN_API_KEY."""
+    if not settings.ADMIN_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin endpoints are disabled: ADMIN_API_KEY is not configured.",
+        )
+    if x_api_key is None or not secrets.compare_digest(x_api_key, settings.ADMIN_API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid X-API-Key header.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +86,7 @@ async def get_top_predictions(
             ge=1,
             le=_MAX_LIMIT,
         ),
-    ] = 5,
+    ] = settings.TOP_PREDICTIONS_LIMIT,
 ) -> TopPicksResponse:
     """
     Top-N predictions endpoint.
@@ -121,9 +138,10 @@ async def get_top_predictions(
     description=(
         "Triggers the full ML prediction pipeline for every scheduled game today. "
         "Predictions are upserted into the database.  Returns the number of games "
-        "that were successfully predicted."
+        "that were successfully predicted.  Requires the X-API-Key header."
     ),
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(require_admin_key)],
     responses={
         200: {
             "description": "Pipeline completed successfully.",
@@ -132,7 +150,9 @@ async def get_top_predictions(
                     "example": {"predictions_made": 8}
                 }
             },
-        }
+        },
+        401: {"description": "Missing or invalid X-API-Key header."},
+        403: {"description": "ADMIN_API_KEY is not configured on the server."},
     },
 )
 async def refresh_predictions(db: DBSession) -> dict:
@@ -141,8 +161,8 @@ async def refresh_predictions(db: DBSession) -> dict:
 
     This is an intentionally synchronous (from the client's perspective)
     endpoint — the pipeline runs inline and the response is returned only
-    after all predictions have been committed.  For large slates consider
-    delegating to a background task queue instead.
+    after all predictions have been committed.  With the Free-plan rate
+    limit (10 requests/minute) a full slate takes one to two minutes.
 
     Returns
     -------
@@ -150,9 +170,7 @@ async def refresh_predictions(db: DBSession) -> dict:
         ``{"predictions_made": <int>}``
     """
     try:
-        await sync_todays_games(db)
-        await sync_all_team_stats(db)
-        count = await prediction_service.run_predictions_for_today(db)
+        count = await prediction_service.refresh_todays_predictions(db)
     except Exception:
         logger.exception("Error running prediction pipeline.")
         raise HTTPException(

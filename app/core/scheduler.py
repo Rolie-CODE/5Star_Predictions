@@ -3,22 +3,41 @@ scheduler.py
 ------------
 APScheduler background job definitions for 5Star Predictions.
 
+All times are in ``settings.LEAGUE_TIMEZONE`` (US Eastern by default).
+
 Jobs:
-  - fetch_and_predict  : Runs every day at 07:00 local time.
-                         Syncs today's games from API-Sports, then runs ML predictions.
-  - fetch_results      : Runs every 2 hours to update finished game scores.
-  - retrain_model      : Runs on the 1st of every month at 03:00 to retrain XGBoost models.
+  - catch_up           : Runs once at startup.  Fills in anything missed while
+                         the server was asleep (Render's free plan sleeps).
+  - fetch_and_predict  : 10:00 and 17:00.  Syncs today's games + lines, team
+                         stats, then runs ML predictions.  The second run
+                         picks up lines that move during the day.
+  - fetch_results      : Every 2 hours from 19:00 to 03:00.  Updates scores
+                         (yesterday + today) and team stats.
+
+Models are not retrained here: the training data lives only on the
+developer's machine and Render's free disk is wiped on restart.  Retrain
+locally with ``python -m app.ml.train`` and commit app/ml/models/.
+
+API-Sports budget on a 12-game day: about 2 × 14 + 5 × 2 ≈ 40 requests,
+well inside the Free plan's 100/day.
 """
 
 import logging
-from contextlib import asynccontextmanager
+from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy import func, select
 
+from app.core.config import settings
+from app.db.models import Game
 from app.db.session import AsyncSessionLocal
-from app.ingestion.data_pipeline import sync_todays_games, sync_all_team_stats
-from app.services.prediction_service import run_predictions_for_today
+from app.ingestion.data_pipeline import backfill_season, recompute_team_stats, sync_recent_results
+from app.ml.predict import model_loader
+from app.services.prediction_service import (
+    refresh_todays_predictions,
+    todays_games_missing_predictions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,20 +46,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 async def job_fetch_and_predict() -> None:
-    """Sync today's games + odds, then run ML predictions for all of them."""
-    logger.info("[Scheduler] Starting daily fetch + predict job...")
+    """Sync today's games + lines and team stats, then run ML predictions."""
+    logger.info("[Scheduler] Starting fetch + predict job...")
     async with AsyncSessionLocal() as db:
         try:
-            games_synced = await sync_todays_games(db)
-            logger.info(f"[Scheduler] Synced {games_synced} games from API-Sports.")
-
-            await sync_all_team_stats(db)
-            logger.info("[Scheduler] Team stats updated.")
-
-            predictions_made = await run_predictions_for_today(db)
-            logger.info(f"[Scheduler] Generated {predictions_made} predictions.")
-        except Exception as exc:
-            logger.exception(f"[Scheduler] fetch_and_predict job failed: {exc}")
+            predictions_made = await refresh_todays_predictions(db)
+            logger.info("[Scheduler] Generated %d predictions.", predictions_made)
+        except Exception:
+            logger.exception("[Scheduler] fetch_and_predict job failed.")
 
 
 async def job_fetch_results() -> None:
@@ -48,25 +61,39 @@ async def job_fetch_results() -> None:
     logger.info("[Scheduler] Refreshing game results...")
     async with AsyncSessionLocal() as db:
         try:
-            synced = await sync_todays_games(db)
-            logger.info(f"[Scheduler] Refreshed {synced} game records.")
-        except Exception as exc:
-            logger.exception(f"[Scheduler] fetch_results job failed: {exc}")
+            synced = await sync_recent_results(db)
+            await recompute_team_stats(db)
+            logger.info("[Scheduler] Refreshed %d game records.", synced)
+        except Exception:
+            logger.exception("[Scheduler] fetch_results job failed.")
 
 
-async def job_retrain_model() -> None:
-    """Monthly retrain — imports and runs the training script in-process."""
-    logger.info("[Scheduler] Starting monthly model retraining...")
-    try:
-        # Import here to avoid circular imports at module load time
-        import importlib
-        train_module = importlib.import_module("app.ml.train")
-        await train_module.run_training()          # train.py must expose run_training()
-        from app.ml.predict import load_models
-        load_models()
-        logger.info("[Scheduler] Model retraining complete.")
-    except Exception as exc:
-        logger.exception(f"[Scheduler] Retrain job failed: {exc}")
+async def job_catch_up() -> None:
+    """
+    Startup job: backfill the season if the DB has no results yet, then run
+    the full pipeline if any of today's games still lack a prediction.
+    """
+    async with AsyncSessionLocal() as db:
+        try:
+            finished = await db.scalar(
+                select(func.count(Game.id)).where(
+                    Game.season == settings.NBA_SEASON, Game.status == "finished"
+                )
+            )
+            if not finished:
+                # One request; succeeds on paid plans only.
+                await backfill_season(db)
+
+            missing = await todays_games_missing_predictions(db)
+            if model_loader.is_loaded and (missing is None or missing > 0):
+                # The full refresh also syncs yesterday's results.
+                count = await refresh_todays_predictions(db)
+                logger.info("[Scheduler] Catch-up generated %d predictions.", count)
+            else:
+                await sync_recent_results(db)
+                await recompute_team_stats(db)
+        except Exception:
+            logger.exception("[Scheduler] catch_up job failed.")
 
 
 # ---------------------------------------------------------------------------
@@ -75,36 +102,36 @@ async def job_retrain_model() -> None:
 
 def create_scheduler() -> AsyncIOScheduler:
     """Build and return a configured APScheduler instance (not yet started)."""
-    scheduler = AsyncIOScheduler()
+    tz = settings.league_tz
+    scheduler = AsyncIOScheduler(timezone=tz)
 
-    # Daily at 07:00 — fetch games + predict
+    scheduler.add_job(
+        job_catch_up,
+        trigger="date",
+        run_date=datetime.now(tz),
+        id="catch_up",
+        name="Startup catch-up",
+        replace_existing=True,
+    )
+
     scheduler.add_job(
         job_fetch_and_predict,
-        trigger=CronTrigger(hour=7, minute=0),
+        trigger=CronTrigger(hour="10,17", minute=0, timezone=tz),
         id="fetch_and_predict",
-        name="Daily fetch + predict",
+        name="Fetch + predict",
         replace_existing=True,
         misfire_grace_time=3600,   # allow up to 1h late start
+        coalesce=True,
     )
 
-    # Every 2 hours — refresh scores (only meaningful on game days, harmless otherwise)
     scheduler.add_job(
         job_fetch_results,
-        trigger=CronTrigger(minute=0, hour="*/2"),
+        trigger=CronTrigger(hour="19,21,23,1,3", minute=0, timezone=tz),
         id="fetch_results",
-        name="Bi-hourly score refresh",
+        name="Evening score refresh",
         replace_existing=True,
         misfire_grace_time=1800,
-    )
-
-    # 1st of every month at 03:00 — retrain
-    scheduler.add_job(
-        job_retrain_model,
-        trigger=CronTrigger(day=1, hour=3, minute=0),
-        id="retrain_model",
-        name="Monthly model retrain",
-        replace_existing=True,
-        misfire_grace_time=7200,
+        coalesce=True,
     )
 
     return scheduler

@@ -3,24 +3,27 @@ app/ingestion/api_sports.py
 ---------------------------
 Async HTTP client wrapping the API-Sports Basketball v1 API.
 
-All public methods return parsed Python objects (list[dict] or dict | None).
-They never raise on API-level errors — failures are logged and an empty
-result is returned so the ingestion pipeline can continue gracefully.
+All public methods return parsed Python objects (list[dict]).  They never
+raise on API-level errors — failures are logged and an empty result is
+returned so the ingestion pipeline can continue gracefully.
 
 Usage
 -----
     from app.ingestion.api_sports import api_sports_client
 
-    games = await api_sports_client.get_todays_games(league_id=12, season="2025-2026")
+    games = await api_sports_client.get_games_on_date(date(2026, 10, 21))
 
 The module exports a module-level singleton ``api_sports_client`` so the
-``httpx.AsyncClient`` connection pool is shared across all callers.
+``httpx.AsyncClient`` connection pool (and the rate limiter) is shared
+across all callers.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import date, timedelta
+import time
+from datetime import date
 from typing import Any
 
 import httpx
@@ -32,9 +35,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-# Bet365 bookmaker ID on API-Sports
-_BET365_BOOKMAKER_ID: int = 6
 
 # Default timeout (seconds) for all API-Sports requests
 _REQUEST_TIMEOUT: float = 20.0
@@ -58,6 +58,9 @@ class ApiSportsClient:
     def __init__(self) -> None:
         # Lazily initialised in _client()
         self._http: httpx.AsyncClient | None = None
+        # Monotonic timestamps of recent requests, for the per-minute limit.
+        self._recent_requests: list[float] = []
+        self._rate_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -76,6 +79,20 @@ class ApiSportsClient:
             )
         return self._http
 
+    async def _wait_for_rate_limit(self) -> None:
+        """Sleep until another request fits in the per-minute budget."""
+        limit = settings.API_SPORTS_MAX_REQUESTS_PER_MINUTE
+        if limit <= 0:
+            return
+        async with self._rate_lock:
+            while True:
+                now = time.monotonic()
+                self._recent_requests = [t for t in self._recent_requests if now - t < 60]
+                if len(self._recent_requests) < limit:
+                    self._recent_requests.append(now)
+                    return
+                await asyncio.sleep(60 - (now - self._recent_requests[0]) + 0.1)
+
     async def _get(self, endpoint: str, params: dict[str, Any]) -> dict | None:
         """
         Execute a GET request against *endpoint* with *params*.
@@ -86,14 +103,14 @@ class ApiSportsClient:
             The parsed JSON body on success, or ``None`` if the request
             failed or the body could not be decoded.
         """
-        url = endpoint  # base_url handles the host
+        await self._wait_for_rate_limit()
         try:
-            response = await self._client().get(url, params=params)
+            response = await self._client().get(endpoint, params=params)
             response.raise_for_status()
             data: dict = response.json()
 
             # API-Sports signals server-side errors via the `errors` field
-            # even when HTTP 200 is returned.
+            # even when HTTP 200 is returned (e.g. plan restrictions).
             errors = data.get("errors")
             if errors:
                 logger.warning(
@@ -141,243 +158,66 @@ class ApiSportsClient:
         resp = data.get("response", [])
         return resp if isinstance(resp, list) else []
 
-    @staticmethod
-    def _response_object(data: dict | None) -> dict | None:
-        """
-        Extract the ``response`` object from an API-Sports payload where
-        the response is a single dict (not a list).
-
-        Returns ``None`` when unavailable.
-        """
-        if data is None:
-            return None
-        resp = data.get("response")
-        return resp if isinstance(resp, dict) else None
-
     # ------------------------------------------------------------------
     # Public API methods
     # ------------------------------------------------------------------
 
-    async def get_todays_games(
-        self,
-        league_id: int,
-        season: str,
-    ) -> list[dict]:
+    async def get_games_on_date(self, day: date, league_id: int) -> list[dict]:
         """
-        Fetch all games scheduled for **today** (calendar date, UTC).
+        Fetch all *league_id* games on *day* (a league-local calendar date).
 
-        Parameters
-        ----------
-        league_id:
-            API-Sports internal league identifier (e.g. 12 for NBA).
-        season:
-            Season string such as ``'2025-2026'``.
-
-        Returns
-        -------
-        list[dict]
-            Raw game objects from the API ``response`` array.  Empty list on
-            any error.
+        The request deliberately omits ``league``/``season``: the Free plan
+        rejects current seasons when they are passed, but allows a date-only
+        query (for yesterday → tomorrow).  Results are filtered client-side.
+        The ``timezone`` parameter makes the date boundaries follow
+        ``settings.LEAGUE_TIMEZONE`` instead of UTC.
         """
-        today_str = date.today().isoformat()  # YYYY-MM-DD
-        logger.debug(
-            "Fetching today's games: league=%d, season=%s, date=%s",
-            league_id,
-            season,
-            today_str,
-        )
         data = await self._get(
             "/games",
-            params={"date": today_str, "league": league_id, "season": season},
+            params={"date": day.isoformat(), "timezone": settings.LEAGUE_TIMEZONE},
         )
-        games = self._response_list(data)
-        logger.info("get_todays_games returned %d game(s).", len(games))
+        games = [
+            g for g in self._response_list(data)
+            if (g.get("league") or {}).get("id") == league_id
+        ]
+        logger.info("get_games_on_date(%s) returned %d game(s).", day, len(games))
         return games
 
-    async def get_upcoming_games(
-        self,
-        league_id: int,
-        season: str,
-    ) -> list[dict]:
+    async def get_season_games(self, league_id: int, season: str) -> list[dict]:
         """
-        Fetch all games in the upcoming 24-hour window.
+        Fetch every game of a season in a single request.
 
-        The window is built by combining today's and tomorrow's schedules so
-        we never miss a game that tips off around midnight UTC.  Duplicates
-        (games that appear in both responses) are deduplicated by ``id``.
-
-        Parameters
-        ----------
-        league_id:
-            API-Sports internal league identifier.
-        season:
-            Season string such as ``'2025-2026'``.
-
-        Returns
-        -------
-        list[dict]
-            Deduplicated raw game objects.  Empty list on error.
+        Paid plans only for the current season; on the Free plan this
+        returns an empty list (the plan error is logged).
         """
-        today_str = date.today().isoformat()
-        tomorrow_str = (date.today() + timedelta(days=1)).isoformat()
-
-        logger.debug(
-            "Fetching upcoming games: league=%d, season=%s, today=%s, tomorrow=%s",
-            league_id,
-            season,
-            today_str,
-            tomorrow_str,
-        )
-
-        today_data, tomorrow_data = (
-            await self._get(
-                "/games",
-                params={"date": today_str, "league": league_id, "season": season},
-            ),
-            await self._get(
-                "/games",
-                params={"date": tomorrow_str, "league": league_id, "season": season},
-            ),
-        )
-
-        today_games = self._response_list(today_data)
-        tomorrow_games = self._response_list(tomorrow_data)
-
-        # Deduplicate by API-Sports game id
-        seen: set[int] = set()
-        combined: list[dict] = []
-        for g in today_games + tomorrow_games:
-            gid = g.get("id")
-            if gid not in seen:
-                seen.add(gid)
-                combined.append(g)
-
-        logger.info("get_upcoming_games returned %d unique game(s).", len(combined))
-        return combined
-
-    async def get_team_statistics(
-        self,
-        team_id: int,
-        league_id: int,
-        season: str,
-    ) -> dict | None:
-        """
-        Fetch season-level statistics for a single team.
-
-        Parameters
-        ----------
-        team_id:
-            API-Sports team identifier.
-        league_id:
-            API-Sports league identifier.
-        season:
-            Season string such as ``'2025-2026'``.
-
-        Returns
-        -------
-        dict | None
-            The ``response`` object from the API, or ``None`` on error.
-        """
-        logger.debug(
-            "Fetching team stats: team_id=%d, league=%d, season=%s",
-            team_id,
-            league_id,
-            season,
-        )
         data = await self._get(
-            "/teams/statistics",
-            params={"team": team_id, "league": league_id, "season": season},
+            "/games",
+            params={
+                "league": league_id,
+                "season": season,
+                "timezone": settings.LEAGUE_TIMEZONE,
+            },
         )
-        stats = self._response_object(data)
-        if stats is None:
-            logger.warning(
-                "No statistics returned for team_id=%d, league=%d, season=%s.",
-                team_id,
-                league_id,
-                season,
-            )
-        return stats
+        games = self._response_list(data)
+        logger.info(
+            "get_season_games(league=%d, season=%s) returned %d game(s).",
+            league_id,
+            season,
+            len(games),
+        )
+        return games
 
     async def get_game_odds(self, game_id: int) -> list[dict]:
         """
-        Fetch odds for a single game from Bet365 (bookmaker id = 6).
+        Fetch odds from every bookmaker for a single game.
 
-        Parameters
-        ----------
-        game_id:
-            API-Sports game identifier.
-
-        Returns
-        -------
-        list[dict]
-            Raw odds objects from the ``response`` array.  Empty list on error.
+        Returns the raw ``response`` array (one entry per game, each with a
+        ``bookmakers`` list).  Empty list on error.
         """
-        logger.debug("Fetching odds: game_id=%d, bookmaker=%d", game_id, _BET365_BOOKMAKER_ID)
-        data = await self._get(
-            "/odds",
-            params={"game": game_id, "bookmaker": _BET365_BOOKMAKER_ID},
-        )
+        data = await self._get("/odds", params={"game": game_id})
         odds = self._response_list(data)
         logger.debug("get_game_odds returned %d entry/entries for game %d.", len(odds), game_id)
         return odds
-
-    async def get_h2h(self, team1_id: int, team2_id: int) -> list[dict]:
-        """
-        Fetch the head-to-head history between two teams.
-
-        Parameters
-        ----------
-        team1_id:
-            API-Sports identifier for the first team.
-        team2_id:
-            API-Sports identifier for the second team.
-
-        Returns
-        -------
-        list[dict]
-            Raw game objects from the ``response`` array.  Empty list on error.
-        """
-        h2h_param = f"{team1_id}-{team2_id}"
-        logger.debug("Fetching H2H: %s", h2h_param)
-        data = await self._get("/games", params={"h2h": h2h_param})
-        games = self._response_list(data)
-        logger.info(
-            "get_h2h (%s) returned %d game(s).", h2h_param, len(games)
-        )
-        return games
-
-    async def get_standings(self, league_id: int, season: str) -> list[dict]:
-        """
-        Fetch league standings for a given season.
-
-        Parameters
-        ----------
-        league_id:
-            API-Sports league identifier.
-        season:
-            Season string such as ``'2025-2026'``.
-
-        Returns
-        -------
-        list[dict]
-            Raw standings objects from the ``response`` array.  Empty list on
-            error.
-        """
-        logger.debug(
-            "Fetching standings: league=%d, season=%s", league_id, season
-        )
-        data = await self._get(
-            "/standings",
-            params={"league": league_id, "season": season},
-        )
-        standings = self._response_list(data)
-        logger.info(
-            "get_standings (league=%d, season=%s) returned %d entry/entries.",
-            league_id,
-            season,
-            len(standings),
-        )
-        return standings
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -398,4 +238,3 @@ class ApiSportsClient:
 #: instantiate ``ApiSportsClient`` yourself, or you will get a separate
 #: connection pool per import site.
 api_sports_client: ApiSportsClient = ApiSportsClient()
-

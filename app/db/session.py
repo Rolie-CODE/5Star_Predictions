@@ -19,8 +19,11 @@ Programmatic initialisation (call once at startup):
     await init_db()
 """
 
+import asyncio
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
+from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -52,8 +55,8 @@ def _build_engine() -> AsyncEngine:
         url,
         # Echo SQL statements only in development so production logs stay clean.
         echo=(settings.APP_ENV == "development"),
-        # For PostgreSQL: keep a pool of up to 10 connections, 20 overflow.
-        # SQLite ignores pool settings (uses NullPool internally via aiosqlite).
+        # Test pooled connections before use so a dropped PostgreSQL
+        # connection doesn't fail the next request.
         pool_pre_ping=True,
         connect_args=connect_args,
     )
@@ -105,23 +108,39 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 # ---------------------------------------------------------------------------
-# Table initialisation
+# Schema migrations
 # ---------------------------------------------------------------------------
+_ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
+
+# Revision matching the schema the pre-Alembic create_all() produced.
+_LEGACY_REVISION = "0001"
+
+
+def _alembic_config():
+    from alembic.config import Config
+
+    config = Config(str(_ALEMBIC_INI))
+    # Keep the app's logging setup instead of alembic.ini's.
+    config.attributes["configure_logging"] = False
+    return config
+
+
 async def init_db() -> None:
     """
-    Create all ORM-mapped tables that do not yet exist in the database.
+    Bring the database schema up to date by running Alembic migrations.
 
-    Call this once at application startup (e.g. from a FastAPI lifespan
-    context manager).  It is a no-op if the tables already exist, so it
-    is safe to call on every startup.
-
-    Note: imports are done *inside* the function to avoid circular-import
-    issues between models and session at module load time.
+    Call this once at application startup.  It is a no-op when the schema
+    is already current.  A database created by the old ``create_all()``
+    startup code (tables present, no ``alembic_version``) is stamped at the
+    initial revision first so its tables aren't re-created.
     """
-    # Import the models module so SQLAlchemy's metadata is populated with
-    # the table definitions before we call create_all.
-    from app.db import models  # noqa: F401 — side-effect import
+    from alembic import command
 
-    async with engine.begin() as conn:
-        # checkfirst=True is implied by create_all (it uses IF NOT EXISTS).
-        await conn.run_sync(models.Base.metadata.create_all)
+    async with engine.connect() as conn:
+        tables = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+
+    config = _alembic_config()
+    # env.py calls asyncio.run(), so run Alembic in a worker thread.
+    if "games" in tables and "alembic_version" not in tables:
+        await asyncio.to_thread(command.stamp, config, _LEGACY_REVISION)
+    await asyncio.to_thread(command.upgrade, config, "head")

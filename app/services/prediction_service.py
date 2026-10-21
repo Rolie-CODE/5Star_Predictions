@@ -14,23 +14,24 @@ All public functions are async and expect an `AsyncSession` from SQLAlchemy.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-# ---------------------------------------------------------------------------
-# Internal project imports
-# ---------------------------------------------------------------------------
-# These modules must exist in the project.  Adjust import paths if your
-# package layout differs.
-from app.db.models import Game, Prediction, Team  # ORM models
-from app.ml import features as feature_engineering  # ML helpers
+from app.core.config import settings
+from app.db.models import Game, Prediction
+from app.ingestion.data_pipeline import recompute_team_stats, sync_games, sync_todays_games
+from app.ml import features as feature_engineering
 from app.ml.predict import prediction_engine
 
 logger = logging.getLogger(__name__)
+
+# Serialises full refreshes (scheduler job vs. manual POST /refresh).
+_refresh_lock = asyncio.Lock()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,12 +43,29 @@ def _utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
+def _as_utc(value: datetime) -> datetime:
+    """SQLite returns naive datetimes; every stored value is UTC."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
 def _today_bounds() -> tuple[datetime, datetime]:
-    """Return (start_of_today_UTC, start_of_tomorrow_UTC) as aware datetimes."""
-    now = _utc_now()
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
-    return start, end
+    """
+    Return the UTC instants bounding today's league-local calendar day.
+
+    An NBA "today" runs midnight to midnight US Eastern, so a 10:30pm ET
+    tip-off (02:30 UTC the next day) still belongs to today's slate.
+    """
+    tz = settings.league_tz
+    today = datetime.now(tz).date()
+    start = datetime.combine(today, time.min, tzinfo=tz)
+    end = datetime.combine(today + timedelta(days=1), time.min, tzinfo=tz)
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def _ou_block(pick: str | None, line: float | None, trust: float | None) -> dict | None:
+    if pick is None or trust is None:
+        return None
+    return {"pick": pick, "line": line, "trust": trust}
 
 
 def _game_to_dict(game: Game, prediction: Prediction | None) -> dict:
@@ -63,16 +81,12 @@ def _game_to_dict(game: Game, prediction: Prediction | None) -> dict:
                 "pick": prediction.winner_pick,
                 "trust": prediction.winner_trust,
             },
-            "full_time_ou": {
-                "pick": prediction.ft_ou_pick,
-                "line": game.ou_line,
-                "trust": prediction.ft_ou_trust,
-            },
-            "half_time_ou": {
-                "pick": prediction.ht_ou_pick,
-                "line": game.ht_ou_line,
-                "trust": prediction.ht_ou_trust,
-            },
+            "full_time_ou": _ou_block(
+                prediction.ft_ou_pick, game.ou_line, prediction.ft_ou_trust
+            ),
+            "half_time_ou": _ou_block(
+                prediction.ht_ou_pick, game.ht_ou_line, prediction.ht_ou_trust
+            ),
         }
 
     return {
@@ -80,7 +94,7 @@ def _game_to_dict(game: Game, prediction: Prediction | None) -> dict:
         "api_sports_id": game.api_sports_id,
         "home_team": game.home_team.name,
         "away_team": game.away_team.name,
-        "tip_off": game.date,
+        "tip_off": _as_utc(game.date),
         "status": game.status,
         "prediction": pred_block,
     }
@@ -123,8 +137,7 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
 
     Steps
     -----
-    1. Query all games for today whose status indicates they haven't started
-       yet ('NS', 'scheduled').
+    1. Query all games on today's league-local slate that haven't started.
     2. Build a feature vector for each game.
     3. Run the ML models to get winner / FT O/U / HT O/U predictions.
     4. Upsert a `Prediction` row in the database.
@@ -136,7 +149,6 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
         and saved.
     """
     start, end = _today_bounds()
-    scheduled_statuses = {"NS", "scheduled"}
 
     # -- 1. Load today's scheduled games ----------------------------------
     stmt = (
@@ -144,7 +156,7 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
         .where(
             Game.date >= start,
             Game.date < end,
-            Game.status.in_(scheduled_statuses),
+            Game.status == "scheduled",
         )
         .options(
             selectinload(Game.home_team),
@@ -166,14 +178,6 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
         try:
             # -- 2. Build feature vector ----------------------------------
             features = await feature_engineering.build_feature_vector(db, game)
-            if features is None:
-                logger.warning(
-                    "Skipping game %d (%s vs %s) — insufficient feature data.",
-                    game.id,
-                    game.home_team.name,
-                    game.away_team.name,
-                )
-                continue
 
             # -- 3. Run ML models -----------------------------------------
             result_payload: dict = prediction_engine.predict(features)
@@ -182,40 +186,16 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
             #   ht_ou_pick, ht_ou_trust, model_version
 
             # -- 4. Upsert Prediction row ----------------------------------
-            existing_stmt = select(Prediction).where(
-                Prediction.game_id == game.id
+            existing_result = await db.execute(
+                select(Prediction).where(Prediction.game_id == game.id)
             )
-            existing_result = await db.execute(existing_stmt)
-            existing: Prediction | None = existing_result.scalar_one_or_none()
-
-            if existing is not None:
-                # Update fields on the existing row
-                await db.execute(
-                    update(Prediction)
-                    .where(Prediction.game_id == game.id)
-                    .values(
-                        winner_pick=result_payload["winner_pick"],
-                        winner_trust=result_payload["winner_trust"],
-                        ft_ou_pick=result_payload["ft_ou_pick"],
-                        ft_ou_trust=result_payload["ft_ou_trust"],
-                        ht_ou_pick=result_payload["ht_ou_pick"],
-                        ht_ou_trust=result_payload["ht_ou_trust"],
-                        model_version=result_payload["model_version"],
-                    )
-                )
-            else:
-                new_prediction = Prediction(
-                    game_id=game.id,
-                    winner_pick=result_payload["winner_pick"],
-                    winner_trust=result_payload["winner_trust"],
-                    ft_ou_pick=result_payload["ft_ou_pick"],
-                    ft_ou_trust=result_payload["ft_ou_trust"],
-                    ht_ou_pick=result_payload["ht_ou_pick"],
-                    ht_ou_trust=result_payload["ht_ou_trust"],
-                    model_version=result_payload["model_version"],
-                    created_at=_utc_now(),
-                )
-                db.add(new_prediction)
+            prediction: Prediction | None = existing_result.scalar_one_or_none()
+            if prediction is None:
+                prediction = Prediction(game_id=game.id)
+                db.add(prediction)
+            for key, value in result_payload.items():
+                setattr(prediction, key, value)
+            prediction.created_at = _utc_now()
 
             await db.flush()  # propagate within the transaction
             count += 1
@@ -237,6 +217,38 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
     await db.commit()
     logger.info("run_predictions_for_today: committed %d prediction(s).", count)
     return count
+
+
+async def refresh_todays_predictions(db: AsyncSession) -> int:
+    """
+    Full pipeline: final scores for yesterday, today's fixtures and lines,
+    team stats, then predictions.  Returns the number of games predicted.
+    """
+    async with _refresh_lock:
+        yesterday = settings.league_today() - timedelta(days=1)
+        await sync_games(db, [yesterday], fetch_odds=False)
+        await sync_todays_games(db)
+        await recompute_team_stats(db)
+        return await run_predictions_for_today(db)
+
+
+async def todays_games_missing_predictions(db: AsyncSession) -> int | None:
+    """
+    Count today's not-yet-started games that have no prediction row.
+
+    Returns ``None`` when no games for today are stored at all (today's
+    fixtures have not been synced yet).
+    """
+    start, end = _today_bounds()
+    result = await db.execute(
+        select(Game.status, Prediction.id)
+        .outerjoin(Prediction, Prediction.game_id == Game.id)
+        .where(Game.date >= start, Game.date < end)
+    )
+    rows = result.all()
+    if not rows:
+        return None
+    return sum(1 for status, prediction_id in rows if status == "scheduled" and prediction_id is None)
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +384,7 @@ async def get_top_predictions(
     stmt = (
         select(Game, Prediction)
         .join(Prediction, Prediction.game_id == Game.id)
-        .where(Game.date >= now, Game.date < end)
+        .where(Game.date >= now, Game.date < end, pick_col.is_not(None))
         .options(
             selectinload(Game.home_team),
             selectinload(Game.away_team),
@@ -395,7 +407,7 @@ async def get_top_predictions(
                 "game_id": game.id,
                 "home_team": game.home_team.name,
                 "away_team": game.away_team.name,
-                "tip_off": game.date,
+                "tip_off": _as_utc(game.date),
                 "pick": pick,
                 "trust": trust,
                 "line": line,

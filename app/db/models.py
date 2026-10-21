@@ -395,7 +395,9 @@ class Prediction(Base):
     Model-generated predictions for a single game.
 
     One prediction row per game (enforced by the unique constraint on
-    ``game_id``). Trust values are confidence percentages in [0, 100].
+    ``game_id``). Trust values are calibrated probabilities in [0, 100].
+    The O/U columns are NULL when no sportsbook line was available or the
+    corresponding model is not validated.
     """
 
     __tablename__ = "predictions"
@@ -429,30 +431,30 @@ class Prediction(Base):
     # ------------------------------------------------------------------ #
     # Full-time over/under pick
     # ------------------------------------------------------------------ #
-    ft_ou_pick: Mapped[str] = mapped_column(
+    ft_ou_pick: Mapped[str | None] = mapped_column(
         String(10),
-        nullable=False,
-        comment="Full-game O/U pick: 'Over' or 'Under'.",
+        nullable=True,
+        comment="Full-game O/U pick: 'Over', 'Under', or NULL if no line.",
     )
 
-    ft_ou_trust: Mapped[float] = mapped_column(
+    ft_ou_trust: Mapped[float | None] = mapped_column(
         Float,
-        nullable=False,
+        nullable=True,
         comment="Model confidence for the full-game O/U pick, in [0, 100].",
     )
 
     # ------------------------------------------------------------------ #
     # Half-time over/under pick
     # ------------------------------------------------------------------ #
-    ht_ou_pick: Mapped[str] = mapped_column(
+    ht_ou_pick: Mapped[str | None] = mapped_column(
         String(10),
-        nullable=False,
-        comment="First-half O/U pick: 'Over' or 'Under'.",
+        nullable=True,
+        comment="First-half O/U pick: 'Over', 'Under', or NULL.",
     )
 
-    ht_ou_trust: Mapped[float] = mapped_column(
+    ht_ou_trust: Mapped[float | None] = mapped_column(
         Float,
-        nullable=False,
+        nullable=True,
         comment="Model confidence for the first-half O/U pick, in [0, 100].",
     )
 

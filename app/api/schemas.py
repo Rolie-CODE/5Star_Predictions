@@ -32,7 +32,7 @@ class WinnerPrediction(BaseModel):
     )
     trust: float = Field(
         ...,
-        description="Confidence score as a percentage (0–100).",
+        description="Calibrated probability of the pick, as a percentage (50–100).",
         examples=[73.4],
         ge=0.0,
         le=100.0,
@@ -56,7 +56,7 @@ class OUPrediction(BaseModel):
     )
     trust: float = Field(
         ...,
-        description="Confidence score as a percentage (0–100).",
+        description="Calibrated probability of the pick, as a percentage (50–100).",
         examples=[61.2],
         ge=0.0,
         le=100.0,
@@ -69,11 +69,13 @@ class GamePrediction(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     winner: WinnerPrediction = Field(..., description="Winner prediction.")
-    full_time_ou: OUPrediction = Field(
-        ..., description="Full-time Over/Under prediction."
+    full_time_ou: OUPrediction | None = Field(
+        default=None,
+        description="Full-time Over/Under prediction, or null when no sportsbook line was available.",
     )
-    half_time_ou: OUPrediction = Field(
-        ..., description="Half-time Over/Under prediction."
+    half_time_ou: OUPrediction | None = Field(
+        default=None,
+        description="Half-time Over/Under prediction, or null while no validated half-time model exists.",
     )
 
 
@@ -98,7 +100,7 @@ class GameResponse(BaseModel):
     )
     status: str = Field(
         ...,
-        description="Current game status (e.g. 'NS', 'scheduled', 'live', 'FT').",
+        description="Game status: 'scheduled', 'live', 'finished', 'postponed' or 'cancelled'.",
     )
     prediction: GamePrediction | None = Field(
         default=None,
@@ -126,7 +128,7 @@ class TopPickItem(BaseModel):
     )
     trust: float = Field(
         ...,
-        description="Confidence score as a percentage (0–100).",
+        description="Calibrated probability of the pick, as a percentage (50–100).",
         ge=0.0,
         le=100.0,
     )
@@ -166,6 +168,7 @@ class HealthResponse(BaseModel):
         description="Overall service health: 'ok' or 'degraded'.",
         examples=["ok", "degraded"],
     )
+    environment: str = Field(..., description="Value of APP_ENV.")
     models_loaded: bool = Field(
         ..., description="True if ML models are loaded and ready."
     )
