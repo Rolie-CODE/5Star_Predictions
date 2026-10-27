@@ -5,11 +5,10 @@ import pytest
 
 from app.ml import train
 from app.ml.features import (
-    BASELINE_PPG,
     FT_OU_FEATURE_COLUMNS,
+    REST_CAP,
     WINNER_FEATURE_COLUMNS,
-    TeamForm,
-    features_from_forms,
+    LeagueHistory,
 )
 from app.ml.predict import Calibrator, PredictionEngine
 
@@ -23,15 +22,20 @@ def _record(day, home, away, home_score, away_score, line=None):
 
 def test_training_features_use_only_earlier_games():
     records = [_record(2, "A", "B", 100, 90, 200.0), _record(1, "A", "C", 130, 120)]
-    rows, wx, wy, trows, tx, ty = train._features_for_records(records)
-    assert [r.date.day for r in rows] == [1, 2]
-    home_ppg = WINNER_FEATURE_COLUMNS.index("home_ppg")
-    assert wx[0][home_ppg] == BASELINE_PPG  # first game: no history yet
-    assert wx[1][home_ppg] == 130           # only the day-1 game is known
+    pairs, history = train.pregame_features(records)
+    assert [game.date.day for game, _ in pairs] == [1, 2]
+    wx, wy = train.winner_samples(pairs)
+    net = WINNER_FEATURE_COLUMNS.index("home_net_rating")
+    rest = WINNER_FEATURE_COLUMNS.index("home_rest_days")
+    assert wx[0][net] == 0 and wx[0][rest] == REST_CAP  # first game: no history yet
+    assert wx[1][net] == 10 and wx[1][rest] == 1        # only the day-1 game is known
     assert wy == [1, 1]
     # Only the game with a line becomes a totals sample: 190 < 200 -> Under.
+    tx, ty = train.totals_samples(train.totals_pairs(pairs))
     assert len(tx) == 1 and ty == [0]
-    assert tx[0][FT_OU_FEATURE_COLUMNS.index("ou_line")] == 200.0
+    assert len(tx[0]) == len(FT_OU_FEATURE_COLUMNS)
+    # The final state includes both games (it becomes the live carryover).
+    assert history.carryover()["avg_totals"] == {"2024": 220.0}
 
 
 @pytest.mark.skipif(
@@ -73,7 +77,7 @@ class _FakeLoader:
 
 
 def _features(ou_line):
-    return features_from_forms(TeamForm(), TeamForm(), ou_line, None)
+    return LeagueHistory().features(2024, datetime(2024, 11, 1).date(), "A", "B", ou_line)
 
 
 def test_prediction_skips_totals_without_a_line():

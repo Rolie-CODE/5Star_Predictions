@@ -7,9 +7,10 @@ them, using only what was known before that season: fitted on all earlier
 seasons except the latest ones, calibrated on those latest seasons, then
 scored on the test season.  Results are compared with simple baselines:
 
-* Winner: "always pick the home team", a basic Elo rating and, where the
-  money-line file has the game (2006-07 to 2017-18), the sportsbook
-  favourite.  The sportsbook comparison uses only those games.
+* Winner: "always pick the home team", the Elo rating from the features on
+  its own and, where the money-line file has the game (2006-07 to
+  2017-18), the sportsbook favourite.  The sportsbook comparison uses only
+  those games.
 * Full-game totals: "always Over" / "always Under", and profit per bet at
   standard -110 prices (52.4% is break-even).
 
@@ -28,6 +29,7 @@ import numpy as np
 from sklearn.metrics import brier_score_loss
 
 from app.ml import train
+from app.ml.features import season_year
 
 FIRST_TEST_SEASON = 2010
 # Calibrate on the latest seasons before the test season, adding seasons
@@ -36,63 +38,11 @@ MIN_CALIBRATION_ROWS = 1000
 # Skip test seasons too small to say anything (partial files, the current season).
 MIN_TEST_ROWS = 200
 
-# Elo: 1500 average, home-court bonus in rating points, and the share of a
-# rating kept over the summer (the rest regresses to the average).
-ELO_START = 1500.0
-ELO_K = 20.0
-ELO_HOME_ADVANTAGE = 100.0
-ELO_CARRYOVER = 0.75
-
 # Profit on a winning 1-unit bet at -110; a loss costs 1 unit.
 WIN_PAYOUT = 100 / 110
 TRUST_THRESHOLDS = (0.50, 0.55, 0.60)
 
 OUTPUT_FILE = train.MODELS_DIR / "backtest.json"
-
-
-def season_year(season: str) -> int:
-    """'2017-18' and '2017-2018' both start in 2017."""
-    return int(season[:4])
-
-
-# ---------------------------------------------------------------------------
-# Elo baseline
-# ---------------------------------------------------------------------------
-
-
-class Elo:
-    """Pre-game home-win probabilities from a basic Elo rating."""
-
-    def __init__(self) -> None:
-        self._ratings: dict[str, float] = {}
-        self._seasons: dict[str, str] = {}
-
-    def _rating(self, team: str, season: str) -> float:
-        rating = self._ratings.get(team, ELO_START)
-        if self._seasons.get(team, season) != season:
-            rating = ELO_START + ELO_CARRYOVER * (rating - ELO_START)
-        self._seasons[team] = season
-        self._ratings[team] = rating
-        return rating
-
-    def home_win_prob(self, season: str, home: str, away: str) -> float:
-        diff = self._rating(home, season) + ELO_HOME_ADVANTAGE - self._rating(away, season)
-        return 1 / (1 + 10 ** (-diff / 400))
-
-    def update(self, season: str, home: str, away: str, home_won: bool) -> None:
-        shift = ELO_K * (home_won - self.home_win_prob(season, home, away))
-        self._ratings[home] += shift
-        self._ratings[away] -= shift
-
-
-def elo_home_probs(records: list[train.GameRecord]) -> dict[str, float]:
-    """Pre-game Elo home-win probability for every game, by game id."""
-    elo = Elo()
-    probs: dict[str, float] = {}
-    for game in sorted(records, key=lambda item: (item.date, item.season, item.home_id)):
-        probs[game.game_id] = elo.home_win_prob(game.season, game.home_id, game.away_id)
-        elo.update(game.season, game.home_id, game.away_id, game.home_score > game.away_score)
-    return probs
 
 
 # ---------------------------------------------------------------------------
@@ -110,14 +60,16 @@ class Sample:
 
 
 def build_samples(records: list[train.GameRecord]) -> tuple[list[Sample], list[Sample]]:
-    """(winner samples, totals samples) for one source, with Elo baselines."""
-    rows, wx, wy, trows, tx, ty = train._features_for_records(records)
-    elo = elo_home_probs(records)
+    """(winner samples, totals samples), with Elo and sportsbook baselines."""
+    pairs, _ = train.pregame_features(records)
+    wx, wy = train.winner_samples(pairs)
     winner = [
-        Sample(season_year(r.season), x, y, elo[r.game_id], r.home_market_prob)
-        for r, x, y in zip(rows, wx, wy)
+        Sample(season_year(game.season), x, y, values["elo_home_prob"], game.home_market_prob)
+        for (game, values), x, y in zip(pairs, wx, wy)
     ]
-    totals = [Sample(season_year(r.season), x, y) for r, x, y in zip(trows, tx, ty)]
+    t_pairs = train.totals_pairs(pairs)
+    tx, ty = train.totals_samples(t_pairs)
+    totals = [Sample(season_year(game.season), x, y) for (game, _), x, y in zip(t_pairs, tx, ty)]
     return winner, totals
 
 
@@ -294,13 +246,8 @@ def run_backtest(
     first_train_season: int | None = train.FIRST_TRAINING_SEASON,
 ) -> dict:
     """CPU-bound; builds every per-season model and returns the report."""
-    kaggle_games, api_games = train.load_records(db_games, first_train_season)
-    winner: list[Sample] = []
-    totals: list[Sample] = []
-    for records in (kaggle_games, api_games):
-        w, t = build_samples(records)
-        winner += w
-        totals += t
+    records, _ = train.load_records(db_games, first_train_season)
+    winner, totals = build_samples(records)
 
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),

@@ -115,6 +115,18 @@ class ModelLoader:
         else:
             logger.warning("metadata.json not found; version info will be unavailable.")
         model_meta: dict = metadata.get("models", {})
+        for name, columns in (
+            ("winner_model", WINNER_FEATURE_COLUMNS),
+            ("ft_ou_model", FT_OU_FEATURE_COLUMNS),
+        ):
+            trained = model_meta.get(name, {}).get("feature_columns")
+            if trained is not None and trained != columns:
+                # Serving a model with other inputs than it was trained on
+                # gives confident nonsense; refuse instead.
+                raise FileNotFoundError(
+                    f"{name} was trained on different feature columns than the code builds. "
+                    "Run `python -m app.ml.train` to retrain."
+                )
 
         # Build everything first, then swap in, so a retrain that fails
         # half-way never leaves a mix of old and new models.
