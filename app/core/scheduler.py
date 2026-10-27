@@ -8,9 +8,10 @@ All times are in ``settings.LEAGUE_TIMEZONE`` (US Eastern by default).
 Jobs:
   - catch_up           : Runs once at startup.  Fills in anything missed while
                          the server was asleep (Render's free plan sleeps).
-  - fetch_and_predict  : 10:00 and 17:00.  Syncs today's games + lines, team
-                         stats, then runs ML predictions.  The second run
-                         picks up lines that move during the day.
+  - fetch_and_predict  : 10:00 and 17:00.  Syncs today's and tomorrow's
+                         games + lines, team stats, then runs ML predictions.
+                         The second run picks up lines that move during the
+                         day.
   - fetch_results      : Every 2 hours from 19:00 to 03:00.  Updates scores
                          (yesterday + today) and team stats.
 
@@ -18,8 +19,8 @@ Models are not retrained here: the training data lives only on the
 developer's machine and Render's free disk is wiped on restart.  Retrain
 locally with ``python -m app.ml.train`` and commit app/ml/models/.
 
-API-Sports budget on a 12-game day: about 2 × 14 + 5 × 2 ≈ 40 requests,
-well inside the Free plan's 100/day.
+API-Sports budget with 12 games today and tomorrow: about 2 × 27 + 5 × 2
+≈ 65 requests, inside the Free plan's 100/day.
 """
 
 import logging

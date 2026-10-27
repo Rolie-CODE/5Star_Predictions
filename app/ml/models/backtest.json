@@ -1,0 +1,361 @@
+{
+  "generated_at": "2026-10-28T04:03:39.229363+00:00",
+  "method": "walk-forward by season: fit on earlier seasons, calibrate on the latest seasons before the test season (>= 1000 games), test on the season",
+  "first_test_season": 2010,
+  "winner_model": {
+    "seasons": {
+      "2010": {
+        "games": 1187,
+        "model_accuracy": 0.6816,
+        "model_brier": 0.2068,
+        "always_home_accuracy": 0.6049,
+        "elo_accuracy": 0.6782,
+        "elo_brier": 0.2042
+      },
+      "2011": {
+        "games": 990,
+        "model_accuracy": 0.6586,
+        "model_brier": 0.2165,
+        "always_home_accuracy": 0.5859,
+        "elo_accuracy": 0.6697,
+        "elo_brier": 0.2101
+      },
+      "2012": {
+        "games": 1218,
+        "model_accuracy": 0.6716,
+        "model_brier": 0.2053,
+        "always_home_accuracy": 0.6117,
+        "elo_accuracy": 0.6732,
+        "elo_brier": 0.2045
+      },
+      "2013": {
+        "games": 1211,
+        "model_accuracy": 0.6565,
+        "model_brier": 0.2158,
+        "always_home_accuracy": 0.5756,
+        "elo_accuracy": 0.6482,
+        "elo_brier": 0.2147
+      },
+      "2014": {
+        "games": 1204,
+        "model_accuracy": 0.6636,
+        "model_brier": 0.2074,
+        "always_home_accuracy": 0.5731,
+        "elo_accuracy": 0.6611,
+        "elo_brier": 0.2121
+      },
+      "2015": {
+        "games": 1192,
+        "model_accuracy": 0.6669,
+        "model_brier": 0.2088,
+        "always_home_accuracy": 0.5931,
+        "elo_accuracy": 0.6921,
+        "elo_brier": 0.2006
+      },
+      "2016": {
+        "games": 1185,
+        "model_accuracy": 0.6177,
+        "model_brier": 0.2283,
+        "always_home_accuracy": 0.5831,
+        "elo_accuracy": 0.6371,
+        "elo_brier": 0.222
+      },
+      "2017": {
+        "games": 1126,
+        "model_accuracy": 0.651,
+        "model_brier": 0.2167,
+        "always_home_accuracy": 0.5817,
+        "elo_accuracy": 0.6643,
+        "elo_brier": 0.2132
+      },
+      "2022": {
+        "games": 1231,
+        "model_accuracy": 0.6312,
+        "model_brier": 0.2301,
+        "always_home_accuracy": 0.58,
+        "elo_accuracy": 0.6133,
+        "elo_brier": 0.232
+      },
+      "2023": {
+        "games": 1225,
+        "model_accuracy": 0.6457,
+        "model_brier": 0.2182,
+        "always_home_accuracy": 0.5429,
+        "elo_accuracy": 0.6327,
+        "elo_brier": 0.2192
+      },
+      "2024": {
+        "games": 1227,
+        "model_accuracy": 0.6561,
+        "model_brier": 0.2155,
+        "always_home_accuracy": 0.5428,
+        "elo_accuracy": 0.639,
+        "elo_brier": 0.2201
+      }
+    },
+    "all_test_seasons": {
+      "games": 12996,
+      "model_accuracy": 0.6545,
+      "model_brier": 0.2154,
+      "always_home_accuracy": 0.5793,
+      "elo_accuracy": 0.6549,
+      "elo_brier": 0.214
+    }
+  },
+  "ft_ou_model": {
+    "seasons": {
+      "2010": {
+        "games": 1121,
+        "model_accuracy": 0.5103,
+        "model_brier": 0.251,
+        "always_over_accuracy": 0.479,
+        "always_over_roi": -0.0855,
+        "always_under_roi": -0.0054,
+        "bets": [
+          {
+            "min_trust": 0.5,
+            "bets": 1121,
+            "hit_rate": 0.5103,
+            "roi": -0.0259
+          },
+          {
+            "min_trust": 0.55,
+            "bets": 167,
+            "hit_rate": 0.5449,
+            "roi": 0.0403
+          },
+          {
+            "min_trust": 0.6,
+            "bets": 82,
+            "hit_rate": 0.5122,
+            "roi": -0.0222
+          }
+        ]
+      },
+      "2011": {
+        "games": 976,
+        "model_accuracy": 0.4959,
+        "model_brier": 0.2546,
+        "always_over_accuracy": 0.4857,
+        "always_over_roi": -0.0728,
+        "always_under_roi": -0.0181,
+        "bets": [
+          {
+            "min_trust": 0.5,
+            "bets": 976,
+            "hit_rate": 0.4959,
+            "roi": -0.0533
+          },
+          {
+            "min_trust": 0.55,
+            "bets": 155,
+            "hit_rate": 0.5161,
+            "roi": -0.0147
+          },
+          {
+            "min_trust": 0.6,
+            "bets": 150,
+            "hit_rate": 0.5267,
+            "roi": 0.0055
+          }
+        ]
+      },
+      "2012": {
+        "games": 1202,
+        "model_accuracy": 0.4967,
+        "model_brier": 0.2513,
+        "always_over_accuracy": 0.5033,
+        "always_over_roi": -0.0391,
+        "always_under_roi": -0.0518,
+        "bets": [
+          {
+            "min_trust": 0.5,
+            "bets": 1202,
+            "hit_rate": 0.4967,
+            "roi": -0.0518
+          },
+          {
+            "min_trust": 0.55,
+            "bets": 106,
+            "hit_rate": 0.5094,
+            "roi": -0.0274
+          },
+          {
+            "min_trust": 0.6,
+            "bets": 59,
+            "hit_rate": 0.4915,
+            "roi": -0.0616
+          }
+        ]
+      },
+      "2013": {
+        "games": 1197,
+        "model_accuracy": 0.4787,
+        "model_brier": 0.2515,
+        "always_over_accuracy": 0.5121,
+        "always_over_roi": -0.0223,
+        "always_under_roi": -0.0686,
+        "bets": [
+          {
+            "min_trust": 0.5,
+            "bets": 1197,
+            "hit_rate": 0.4787,
+            "roi": -0.0861
+          },
+          {
+            "min_trust": 0.55,
+            "bets": 6,
+            "hit_rate": 0.5,
+            "roi": -0.0455
+          },
+          {
+            "min_trust": 0.6,
+            "bets": 5,
+            "hit_rate": 0.6,
+            "roi": 0.1455
+          }
+        ]
+      },
+      "2014": {
+        "games": 1180,
+        "model_accuracy": 0.4907,
+        "model_brier": 0.2494,
+        "always_over_accuracy": 0.4864,
+        "always_over_roi": -0.0713,
+        "always_under_roi": -0.0196,
+        "bets": [
+          {
+            "min_trust": 0.5,
+            "bets": 1180,
+            "hit_rate": 0.4907,
+            "roi": -0.0633
+          },
+          {
+            "min_trust": 0.55,
+            "bets": 21,
+            "hit_rate": 0.7619,
+            "roi": 0.4545
+          },
+          {
+            "min_trust": 0.6,
+            "bets": 20,
+            "hit_rate": 0.75,
+            "roi": 0.4318
+          }
+        ]
+      },
+      "2015": {
+        "games": 1182,
+        "model_accuracy": 0.5085,
+        "model_brier": 0.2498,
+        "always_over_accuracy": 0.4949,
+        "always_over_roi": -0.0551,
+        "always_under_roi": -0.0358,
+        "bets": [
+          {
+            "min_trust": 0.5,
+            "bets": 1182,
+            "hit_rate": 0.5085,
+            "roi": -0.0293
+          },
+          {
+            "min_trust": 0.55,
+            "bets": 8,
+            "hit_rate": 0.625,
+            "roi": 0.1932
+          },
+          {
+            "min_trust": 0.6,
+            "bets": 1,
+            "hit_rate": 1.0,
+            "roi": 0.9091
+          }
+        ]
+      },
+      "2016": {
+        "games": 1174,
+        "model_accuracy": 0.5068,
+        "model_brier": 0.2546,
+        "always_over_accuracy": 0.4974,
+        "always_over_roi": -0.0503,
+        "always_under_roi": -0.0406,
+        "bets": [
+          {
+            "min_trust": 0.5,
+            "bets": 1174,
+            "hit_rate": 0.5068,
+            "roi": -0.0324
+          },
+          {
+            "min_trust": 0.55,
+            "bets": 436,
+            "hit_rate": 0.5183,
+            "roi": -0.0104
+          },
+          {
+            "min_trust": 0.6,
+            "bets": 50,
+            "hit_rate": 0.62,
+            "roi": 0.1836
+          }
+        ]
+      },
+      "2017": {
+        "games": 1111,
+        "model_accuracy": 0.5005,
+        "model_brier": 0.2495,
+        "always_over_accuracy": 0.4914,
+        "always_over_roi": -0.0618,
+        "always_under_roi": -0.0291,
+        "bets": [
+          {
+            "min_trust": 0.5,
+            "bets": 1111,
+            "hit_rate": 0.5005,
+            "roi": -0.0446
+          },
+          {
+            "min_trust": 0.55,
+            "bets": 13,
+            "hit_rate": 0.6923,
+            "roi": 0.3217
+          },
+          {
+            "min_trust": 0.6,
+            "bets": 0,
+            "hit_rate": null,
+            "roi": null
+          }
+        ]
+      }
+    },
+    "all_test_seasons": {
+      "games": 9143,
+      "model_accuracy": 0.4984,
+      "model_brier": 0.2514,
+      "always_over_accuracy": 0.4941,
+      "always_over_roi": -0.0566,
+      "always_under_roi": -0.0343,
+      "bets": [
+        {
+          "min_trust": 0.5,
+          "bets": 9143,
+          "hit_rate": 0.4984,
+          "roi": -0.0485
+        },
+        {
+          "min_trust": 0.55,
+          "bets": 912,
+          "hit_rate": 0.5307,
+          "roi": 0.0132
+        },
+        {
+          "min_trust": 0.6,
+          "bets": 367,
+          "hit_rate": 0.545,
+          "roi": 0.0404
+        }
+      ]
+    }
+  }
+}
