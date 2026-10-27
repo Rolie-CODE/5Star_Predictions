@@ -87,3 +87,34 @@ def test_prediction_with_line():
     result = PredictionEngine(_FakeLoader()).predict(_features(225.5))
     assert (result["ft_ou_pick"], result["ft_ou_trust"]) == ("Over", 90.0)
     assert result["ht_ou_pick"] is None  # no validated half-time model
+
+
+def test_money_lines_are_no_vig_and_oriented_per_team(tmp_path, monkeypatch):
+    path = tmp_path / "money_line.csv"
+    path.write_text(
+        "game_id,book_name,book_id,team_id,a_team_id,price1,price2\n"
+        "001,A,1,10,20,-200,170\n"
+        # Same game, the other book lists the teams the other way round.
+        "001,B,2,20,10,180,-220\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(train, "MONEY_LINE_FILE", path)
+    team_id, p = train._read_money_lines()["001"]
+    book_a = (200 / 300) / (200 / 300 + 100 / 270)
+    book_b = (220 / 320) / (220 / 320 + 100 / 280)
+    assert team_id == "10"
+    assert p == pytest.approx((book_a + book_b) / 2)
+
+
+def test_nba_db_games_stop_where_api_sports_starts(tmp_path, monkeypatch):
+    path = tmp_path / "game.csv"
+    path.write_text(
+        "season_id,team_id_home,game_id,game_date,pts_home,team_id_away,pts_away,season_type\n"
+        "22019,1,0021900001,2019-10-22 00:00:00,110.0,2,100.0,Regular Season\n"
+        "42019,1,0041900001,2020-08-17 00:00:00,110.0,2,100.0,Playoffs\n"
+        "22022,1,0022200001,2022-10-18 00:00:00,110.0,2,100.0,Regular Season\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(train, "NBA_DB_GAMES_FILE", path)
+    (game,) = train._read_nba_db_games()
+    assert (game.game_id, game.season, game.home_score) == ("kaggle:0021900001", "2019-20", 110)
