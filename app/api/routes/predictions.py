@@ -3,8 +3,9 @@ app/api/routes/predictions.py
 ------------------------------
 FastAPI router for prediction-specific endpoints.
 
-  GET  /predictions/top     — top-N picks by trust, for a given prediction type
-  POST /predictions/refresh — triggers the full pipeline for today's games
+  GET  /predictions/top         — top-N picks by trust, for a given prediction type
+  GET  /predictions/performance — stored picks graded against final scores
+  POST /predictions/refresh     — triggers the full pipeline for today's games
 
 Prefix: /predictions
 """
@@ -18,7 +19,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.schemas import TopPickItem, TopPicksResponse
+from app.api.schemas import PerformanceResponse, TopPickItem, TopPicksResponse
 from app.core.config import settings
 from app.db.session import get_db  # async session dependency
 from app.services import prediction_service
@@ -125,6 +126,44 @@ async def get_top_predictions(
     top_picks = [TopPickItem.model_validate(p) for p in picks_dicts]
 
     return TopPicksResponse(prediction_type=type, top_picks=top_picks)
+
+
+# ---------------------------------------------------------------------------
+# GET /predictions/performance
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/performance",
+    response_model=PerformanceResponse,
+    summary="Live accuracy of stored predictions",
+    description=(
+        "Grades every stored prediction for a season against final scores. "
+        "Over/Under picks also report profit per bet at -110 prices."
+    ),
+)
+async def get_performance(
+    db: DBSession,
+    season: Annotated[
+        str | None,
+        Query(description="Season to grade, e.g. '2026-2027'. Defaults to the current season."),
+    ] = None,
+    model_version: Annotated[
+        str | None,
+        Query(description="Only grade predictions from this model version, e.g. '3.0.0'."),
+    ] = None,
+) -> PerformanceResponse:
+    try:
+        result = await prediction_service.get_performance(
+            db, season=season or settings.NBA_SEASON, model_version=model_version
+        )
+    except Exception:
+        logger.exception("Error grading predictions.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to grade predictions.",
+        )
+    return PerformanceResponse.model_validate(result)
 
 
 # ---------------------------------------------------------------------------

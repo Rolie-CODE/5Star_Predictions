@@ -253,6 +253,17 @@ def _features_for_records(
     return winner_rows, winner_x, winner_y, totals_rows, totals_x, totals_y
 
 
+def fit_calibrated(
+    X_fit: np.ndarray, y_fit: np.ndarray, X_cal: np.ndarray, y_cal: np.ndarray
+) -> tuple[XGBClassifier, IsotonicRegression]:
+    """Fit the classifier, then an isotonic map from its raw to calibrated probability."""
+    model = XGBClassifier(**XGB_PARAMS)
+    model.fit(X_fit, y_fit, verbose=False)
+    calibrator = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
+    calibrator.fit(model.predict_proba(X_cal)[:, 1], y_cal)
+    return model, calibrator
+
+
 def _fit_temporal(name: str, X: list[list[float]], y: list[int]) -> tuple[XGBClassifier, dict]:
     """
     Fit on the oldest 70%, calibrate on the next 15%, score on the newest 15%.
@@ -269,11 +280,10 @@ def _fit_temporal(name: str, X: list[list[float]], y: list[int]) -> tuple[XGBCla
         raise RuntimeError(f"Not enough examples from both classes for chronological {name} evaluation.")
 
     X_arr, y_arr = np.asarray(X, dtype=float), np.asarray(y)
-    model = XGBClassifier(**XGB_PARAMS)
-    model.fit(X_arr[:train_end], y_arr[:train_end], verbose=False)
-
-    calibrator = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
-    calibrator.fit(model.predict_proba(X_arr[train_end:calib_end])[:, 1], y_arr[train_end:calib_end])
+    model, calibrator = fit_calibrated(
+        X_arr[:train_end], y_arr[:train_end],
+        X_arr[train_end:calib_end], y_arr[train_end:calib_end],
+    )
 
     test_y = y_arr[calib_end:]
     test_p = calibrator.predict(model.predict_proba(X_arr[calib_end:])[:, 1])
@@ -300,9 +310,13 @@ def _save_model(model: XGBClassifier, filename: str) -> None:
     print(f"[train] Saved {MODELS_DIR / filename}")
 
 
-def train_models(db_games: list[GameRecord] | None = None) -> None:
-    """CPU-bound training; call via ``asyncio.to_thread`` from async code."""
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+def load_records(
+    db_games: list[GameRecord] | None = None,
+) -> tuple[list[GameRecord], list[GameRecord]]:
+    """
+    Return (Kaggle games, API-Sports games).  Each source keeps its own team
+    ids, so build features for them separately.
+    """
     print("[train] Loading real Kaggle and API-Sports game results")
     totals = _read_totals()
     kaggle_games = _read_kaggle_games(totals)
@@ -318,6 +332,13 @@ def train_models(db_games: list[GameRecord] | None = None) -> None:
         f"API-Sports CSV: {csv_count} regular-season results; "
         f"app database: {len(db_games or [])} finished games"
     )
+    return kaggle_games, api_games
+
+
+def train_models(db_games: list[GameRecord] | None = None) -> None:
+    """CPU-bound training; call via ``asyncio.to_thread`` from async code."""
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    kaggle_games, api_games = load_records(db_games)
 
     # Build each source independently so a team's historical form never
     # crosses datasets or season boundaries.
@@ -362,14 +383,18 @@ def train_models(db_games: list[GameRecord] | None = None) -> None:
     print("[train] No half-time model: half-time picks stay disabled.")
 
 
+async def read_db_games_or_none() -> list[GameRecord]:
+    """App database games, or none if the database can't be read."""
+    try:
+        return await _read_db_games()
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not read finished games from the database; using CSVs only.")
+        return []
+
+
 async def run_training(use_db: bool = True) -> None:
     """Entry point used by the monthly scheduler and the CLI."""
-    db_games: list[GameRecord] = []
-    if use_db:
-        try:
-            db_games = await _read_db_games()
-        except Exception:  # noqa: BLE001
-            logger.exception("Could not read finished games from the database; training on CSVs only.")
+    db_games = await read_db_games_or_none() if use_db else []
     # Training takes minutes of CPU; keep it off the event loop.
     await asyncio.to_thread(train_models, db_games)
 

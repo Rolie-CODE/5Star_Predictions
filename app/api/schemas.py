@@ -154,6 +154,43 @@ class TopPicksResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Performance schemas
+# ---------------------------------------------------------------------------
+
+
+class PickRecord(BaseModel):
+    """How one prediction type has done on finished games."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    graded: int = Field(..., description="Finished games with a gradable pick.")
+    correct: int = Field(..., description="Picks that were right.")
+    accuracy: float | None = Field(
+        default=None, description="Percent correct, or null when nothing is graded yet."
+    )
+    roi: float | None = Field(
+        default=None,
+        description=(
+            "Profit per bet in percent at standard -110 prices (break-even is 52.4% "
+            "accuracy). Only for Over/Under picks."
+        ),
+    )
+
+
+class PerformanceResponse(BaseModel):
+    """Returned by the /predictions/performance endpoint."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    season: str = Field(..., description="Season graded, e.g. '2026-2027'.")
+    model_version: str | None = Field(
+        default=None, description="Model version filter, or null for all versions."
+    )
+    winner: PickRecord = Field(..., description="Winner picks.")
+    full_time_ou: PickRecord = Field(..., description="Full-time Over/Under picks.")
+
+
+# ---------------------------------------------------------------------------
 # Health check schema
 # ---------------------------------------------------------------------------
 

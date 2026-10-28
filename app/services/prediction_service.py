@@ -24,7 +24,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.db.models import Game, Prediction
-from app.ingestion.data_pipeline import recompute_team_stats, sync_games, sync_todays_games
+from app.ingestion.data_pipeline import recompute_team_stats, sync_games
 from app.ml import features as feature_engineering
 from app.ml.predict import prediction_engine
 
@@ -60,6 +60,17 @@ def _today_bounds() -> tuple[datetime, datetime]:
     start = datetime.combine(today, time.min, tzinfo=tz)
     end = datetime.combine(today + timedelta(days=1), time.min, tzinfo=tz)
     return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def _prediction_window() -> tuple[datetime, datetime]:
+    """
+    UTC instants bounding today's and tomorrow's league-local slates.
+
+    Predicting tomorrow too keeps the rolling 24-hour views (upcoming games,
+    top picks) filled after today's last tip-off.
+    """
+    start, end = _today_bounds()
+    return start, end + timedelta(days=1)
 
 
 def _ou_block(pick: str | None, line: float | None, trust: float | None) -> dict | None:
@@ -133,11 +144,13 @@ async def _fetch_games_with_predictions(
 
 async def run_predictions_for_today(db: AsyncSession) -> int:
     """
-    Run the full prediction pipeline for every scheduled game today.
+    Run the full prediction pipeline for every scheduled game today and
+    tomorrow.
 
     Steps
     -----
-    1. Query all games on today's league-local slate that haven't started.
+    1. Query all games on today's and tomorrow's league-local slates that
+       haven't started.
     2. Build a feature vector for each game.
     3. Run the ML models to get winner / FT O/U / HT O/U predictions.
     4. Upsert a `Prediction` row in the database.
@@ -148,13 +161,15 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
         The number of games for which a prediction was successfully generated
         and saved.
     """
-    start, end = _today_bounds()
+    start, end = _prediction_window()
 
-    # -- 1. Load today's scheduled games ----------------------------------
+    # -- 1. Load today's and tomorrow's scheduled games -------------------
+    # Games past tip-off are skipped even if their status is stale, so each
+    # stored prediction is the last pre-game one and can be graded fairly.
     stmt = (
         select(Game)
         .where(
-            Game.date >= start,
+            Game.date >= max(start, _utc_now()),
             Game.date < end,
             Game.status == "scheduled",
         )
@@ -221,34 +236,39 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
 
 async def refresh_todays_predictions(db: AsyncSession) -> int:
     """
-    Full pipeline: final scores for yesterday, today's fixtures and lines,
-    team stats, then predictions.  Returns the number of games predicted.
+    Full pipeline: final scores for yesterday, today's and tomorrow's
+    fixtures and lines, team stats, then predictions.  Returns the number
+    of games predicted.
     """
     async with _refresh_lock:
-        yesterday = settings.league_today() - timedelta(days=1)
-        await sync_games(db, [yesterday], fetch_odds=False)
-        await sync_todays_games(db)
+        today = settings.league_today()
+        await sync_games(db, [today - timedelta(days=1)], fetch_odds=False)
+        await sync_games(db, [today, today + timedelta(days=1)])
         await recompute_team_stats(db)
         return await run_predictions_for_today(db)
 
 
 async def todays_games_missing_predictions(db: AsyncSession) -> int | None:
     """
-    Count today's not-yet-started games that have no prediction row.
+    Count today's and tomorrow's not-yet-started games that have no
+    prediction row.
 
-    Returns ``None`` when no games for today are stored at all (today's
-    fixtures have not been synced yet).
+    Returns ``None`` when either day has no games stored at all (its
+    fixtures have not been synced yet, or it is an off day).
     """
-    start, end = _today_bounds()
+    start, end = _prediction_window()
+    tomorrow_start = end - timedelta(days=1)
     result = await db.execute(
-        select(Game.status, Prediction.id)
+        select(Game.date, Game.status, Prediction.id)
         .outerjoin(Prediction, Prediction.game_id == Game.id)
         .where(Game.date >= start, Game.date < end)
     )
     rows = result.all()
-    if not rows:
+    if not any(_as_utc(d) < tomorrow_start for d, _, _ in rows) or not any(
+        _as_utc(d) >= tomorrow_start for d, _, _ in rows
+    ):
         return None
-    return sum(1 for status, prediction_id in rows if status == "scheduled" and prediction_id is None)
+    return sum(1 for _, status, prediction_id in rows if status == "scheduled" and prediction_id is None)
 
 
 # ---------------------------------------------------------------------------
@@ -415,3 +435,65 @@ async def get_top_predictions(
         )
 
     return items
+
+
+# Profit on a winning 1-unit bet at -110; a loss costs 1 unit.
+_WIN_PAYOUT = 100 / 110
+
+
+def _pick_record(results: list[bool], *, with_roi: bool) -> dict:
+    graded, correct = len(results), sum(results)
+    return {
+        "graded": graded,
+        "correct": correct,
+        "accuracy": round(correct / graded * 100, 1) if graded else None,
+        "roi": (
+            round((correct * _WIN_PAYOUT - (graded - correct)) / graded * 100, 1)
+            if with_roi and graded
+            else None
+        ),
+    }
+
+
+async def get_performance(
+    db: AsyncSession,
+    season: str,
+    model_version: str | None = None,
+) -> dict:
+    """
+    Grade stored predictions against final scores for *season*.
+
+    Winner picks count when the game has a final score; Over/Under picks
+    when it also has a line (pushes are not graded).  ``roi`` is profit per
+    bet in percent at standard -110 prices.
+    """
+    stmt = (
+        select(Game, Prediction)
+        .join(Prediction, Prediction.game_id == Game.id)
+        .where(
+            Game.season == season,
+            Game.status == "finished",
+            Game.home_score.is_not(None),
+            Game.away_score.is_not(None),
+        )
+    )
+    if model_version is not None:
+        stmt = stmt.where(Prediction.model_version == model_version)
+    rows = (await db.execute(stmt)).all()
+
+    winner: list[bool] = []
+    ft_ou: list[bool] = []
+    for game, prediction in rows:
+        if game.home_score != game.away_score:
+            home_won = game.home_score > game.away_score
+            winner.append((prediction.winner_pick == "Home") == home_won)
+        total = game.home_score + game.away_score
+        if prediction.ft_ou_pick is not None and game.ou_line is not None and total != game.ou_line:
+            ft_ou.append((prediction.ft_ou_pick == "Over") == (total > game.ou_line))
+
+    return {
+        "season": season,
+        "model_version": model_version,
+        "winner": _pick_record(winner, with_roi=False),
+        "full_time_ou": _pick_record(ft_ou, with_roi=True),
+    }
