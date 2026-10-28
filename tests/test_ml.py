@@ -87,6 +87,22 @@ def test_prediction_skips_totals_without_a_line():
     assert result["ht_ou_pick"] is None
 
 
+def test_market_line_sets_the_pick_and_the_model_pick_is_kept():
+    values = _features(None)
+    values["home_market_prob"] = 0.62
+    result = PredictionEngine(_FakeLoader()).predict(values)
+    assert (result["winner_pick"], result["winner_trust"], result["winner_source"]) == (
+        "Home", 62.0, "market",
+    )
+    assert (result["model_winner_pick"], result["model_winner_trust"]) == ("Away", 70.0)
+
+
+def test_without_a_market_line_the_model_pick_is_served():
+    result = PredictionEngine(_FakeLoader()).predict(_features(None))
+    assert result["winner_source"] == "model"
+    assert (result["winner_pick"], result["winner_trust"]) == ("Away", 70.0)
+
+
 def test_prediction_with_line():
     result = PredictionEngine(_FakeLoader()).predict(_features(225.5))
     assert (result["ft_ou_pick"], result["ft_ou_trust"]) == ("Over", 90.0)

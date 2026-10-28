@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from app.ingestion.data_pipeline import (
+    _extract_home_win_prob,
     _extract_line,
     _main_line,
     _parse_game,
@@ -71,3 +74,16 @@ def test_parse_game_stores_tip_off_in_utc():
     assert parsed["date"] == datetime(2026, 10, 22, 2, 30, tzinfo=timezone.utc)
     assert parsed["season"] == "2026-2027"
     assert parsed["home_score"] is None and parsed["home_halftime_score"] is None
+
+
+def test_home_win_prob_removes_the_margin_and_takes_the_median():
+    def book(home, away):
+        return {"bets": [{"id": 2, "name": "Home/Away", "values": _values([
+            ("Home", home), ("Away", away),
+        ])}]}
+
+    odds = [{"bookmakers": [book("2.00", "1.80"), book("2.14", "1.76"), book("2.00", "1.75")]}]
+    probs = sorted((1 / h) / (1 / h + 1 / a) for h, a in ((2.0, 1.8), (2.14, 1.76), (2.0, 1.75)))
+    assert _extract_home_win_prob(odds) == pytest.approx(probs[1])
+    assert _extract_home_win_prob([{"bookmakers": [book("bad", "1.80")]}]) is None
+    assert _extract_home_win_prob([]) is None

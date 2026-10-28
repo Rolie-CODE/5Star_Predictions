@@ -294,13 +294,16 @@ class LeagueHistory:
         away: str,
         ou_line: float | None,
         ht_ou_line: float | None = None,
+        home_market_prob: float | None = None,
     ) -> dict:
         """
         Feature dict for a game on *day* (league-local date).
 
         Besides the model columns it carries the raw ``ou_line`` and
         ``ht_ou_line`` (``None`` when missing; the O/U heads are only run
-        with a line) and ``elo_home_prob``, used as a backtest baseline.
+        with a line), the sportsbook ``home_market_prob`` (served instead of
+        the winner model when present) and ``elo_home_prob``, used as a
+        backtest baseline.
         """
         home_form, away_form = self._forms[(season, home)], self._forms[(season, away)]
         avg_total = self.league_avg_total(season)
@@ -339,6 +342,7 @@ class LeagueHistory:
             "expected_total_vs_line": None if ou_line is None else expected_total - ou_line,
             "ou_line": ou_line,
             "ht_ou_line": ht_ou_line,
+            "home_market_prob": home_market_prob,
             "elo_home_prob": 1 / (1 + 10 ** (-(elo_diff + ELO_HOME_ADVANTAGE) / 400)),
         }
 
@@ -464,6 +468,7 @@ async def build_feature_vectors(db: AsyncSession, games: list[Game]) -> list[dic
             str(game.away_team.api_sports_id),
             game.ou_line,
             game.ht_ou_line,
+            game.home_win_prob,
         )
     return [features_by_id[game.id] for game in games]
 

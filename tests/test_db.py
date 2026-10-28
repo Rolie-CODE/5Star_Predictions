@@ -54,3 +54,6 @@ def test_migrations_build_the_model_schema(tmp_path, monkeypatch):
     }
     assert columns["ft_ou_pick"]["nullable"] and columns["ht_ou_trust"]["nullable"]
     assert not columns["winner_pick"]["nullable"]
+    assert {"winner_source", "model_winner_pick", "model_winner_trust"} <= set(columns)
+    games = {c["name"] for c in inspect(create_engine(f"sqlite:///{db_path}")).get_columns("games")}
+    assert "home_win_prob" in games

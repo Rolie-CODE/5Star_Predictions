@@ -91,6 +91,10 @@ def _game_to_dict(game: Game, prediction: Prediction | None) -> dict:
             "winner": {
                 "pick": prediction.winner_pick,
                 "trust": prediction.winner_trust,
+                # Rows from before 4.0.0 have no source; they were model picks.
+                "source": prediction.winner_source or "model",
+                "model_pick": prediction.model_winner_pick or prediction.winner_pick,
+                "model_trust": prediction.model_winner_trust or prediction.winner_trust,
             },
             "full_time_ou": _ou_block(
                 prediction.ft_ou_pick, game.ou_line, prediction.ft_ou_trust
@@ -464,7 +468,9 @@ async def get_performance(
     Grade stored predictions against final scores for *season*.
 
     Winner picks count when the game has a final score; Over/Under picks
-    when it also has a line (pushes are not graded).  ``roi`` is profit per
+    when it also has a line (pushes are not graded).  ``winner`` grades the
+    served picks, ``model_winner`` the model's own, and ``market_games``
+    compares the two on the games where the market's pick was served.  ``roi`` is profit per
     bet in percent at standard -110 prices.
     """
     stmt = (
@@ -482,11 +488,21 @@ async def get_performance(
     rows = (await db.execute(stmt)).all()
 
     winner: list[bool] = []
+    model_winner: list[bool] = []
+    market_served: list[bool] = []
+    model_on_market_games: list[bool] = []
     ft_ou: list[bool] = []
     for game, prediction in rows:
         if game.home_score != game.away_score:
             home_won = game.home_score > game.away_score
-            winner.append((prediction.winner_pick == "Home") == home_won)
+            served = (prediction.winner_pick == "Home") == home_won
+            model_pick = prediction.model_winner_pick or prediction.winner_pick
+            model = (model_pick == "Home") == home_won
+            winner.append(served)
+            model_winner.append(model)
+            if prediction.winner_source == "market":
+                market_served.append(served)
+                model_on_market_games.append(model)
         total = game.home_score + game.away_score
         if prediction.ft_ou_pick is not None and game.ou_line is not None and total != game.ou_line:
             ft_ou.append((prediction.ft_ou_pick == "Over") == (total > game.ou_line))
@@ -495,5 +511,10 @@ async def get_performance(
         "season": season,
         "model_version": model_version,
         "winner": _pick_record(winner, with_roi=False),
+        "model_winner": _pick_record(model_winner, with_roi=False),
+        "market_games": {
+            "market": _pick_record(market_served, with_roi=False),
+            "model": _pick_record(model_on_market_games, with_roi=False),
+        },
         "full_time_ou": _pick_record(ft_ou, with_roi=True),
     }

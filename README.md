@@ -35,7 +35,7 @@ is gitignored):
 - `data/api_sports_nba_historical_2022_2025.csv` — exported from API-Sports with
   your own key
 - Optional, same Kaggle dataset: `data/kaggle_nba/nba_betting_money_line.csv`
-  (used by the backtest's sportsbook baseline)
+  (used by the backtest's sportsbook baseline; not a model input)
 - Optional: `data/kaggle_nba/csv/game.csv` from the
   [NBA Basketball Database](https://www.kaggle.com/datasets/wyattowalsh/basketball).
   It fills the seasons between the two sources above (2018-19 to 2021-22) and
@@ -103,6 +103,14 @@ are scored by profit per bet at -110. Results go to
 
 `full_time_ou` is `null` for games with no sportsbook line yet, and
 `half_time_ou` is always `null` until a validated half-time model exists.
+
+The winner pick comes from the sportsbook money line when the game has one
+(`winner.source` is `market`): its no-vig probability was more accurate than
+the model in the backtest (68.7% vs 66.8%), and so was every blend of the two.
+`winner.model_pick` and `winner.model_trust` always carry the model's own view,
+so you can show where it disagrees. Games without a line use the model
+(`source` is `model`). `/predictions/performance` grades both, and compares
+them on the games where the market was used.
 
 ### Query params for `/predictions/top`
 - `type` — `winner` (default), `ft_ou`, `ht_ou`

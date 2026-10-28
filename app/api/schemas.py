@@ -37,6 +37,25 @@ class WinnerPrediction(BaseModel):
         ge=0.0,
         le=100.0,
     )
+    source: str = Field(
+        default="model",
+        description=(
+            "'market' when pick and trust come from the sportsbook money line (no-vig, "
+            "median across books), 'model' when the game has no line yet."
+        ),
+        examples=["market", "model"],
+    )
+    model_pick: str | None = Field(
+        default=None,
+        description="The model's own pick; differs from `pick` when it disagrees with the market.",
+        examples=["Away"],
+    )
+    model_trust: float | None = Field(
+        default=None,
+        description="The model's own calibrated probability for `model_pick`, in percent.",
+        ge=0.0,
+        le=100.0,
+    )
 
 
 class OUPrediction(BaseModel):
@@ -177,6 +196,15 @@ class PickRecord(BaseModel):
     )
 
 
+class MarketComparison(BaseModel):
+    """Served market picks and the model's own picks, on the same games."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    market: PickRecord = Field(..., description="The sportsbook favourite.")
+    model: PickRecord = Field(..., description="The model's pick on those games.")
+
+
 class PerformanceResponse(BaseModel):
     """Returned by the /predictions/performance endpoint."""
 
@@ -186,7 +214,11 @@ class PerformanceResponse(BaseModel):
     model_version: str | None = Field(
         default=None, description="Model version filter, or null for all versions."
     )
-    winner: PickRecord = Field(..., description="Winner picks.")
+    winner: PickRecord = Field(..., description="Winner picks as served.")
+    model_winner: PickRecord = Field(..., description="The model's own winner picks.")
+    market_games: MarketComparison = Field(
+        ..., description="Market vs. model on the games where the market's pick was served."
+    )
     full_time_ou: PickRecord = Field(..., description="Full-time Over/Under picks.")
 
 

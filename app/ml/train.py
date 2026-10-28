@@ -14,6 +14,10 @@ after the last game is saved to ``carryover.json`` for live inference.
 Each model is fitted on the oldest 70% of games, calibrated on the next
 15%, and scored on the newest 15%, all in chronological order.
 
+The sportsbook money line is not a model input: in the backtest neither a
+model given it as a feature nor a blend beat the no-vig money line alone,
+so the app serves the market's probability when a game has a line.
+
 Kaggle's historical totals file has full-game lines only, so no halftime
 model is trained here; the API serves no half-time picks until one is
 validated.
@@ -288,6 +292,7 @@ async def _read_db_games() -> list[GameRecord]:
                 home_score=game.home_score,
                 away_score=game.away_score,
                 ou_line=game.ou_line,
+                home_market_prob=game.home_win_prob,
             )
         )
     return records
