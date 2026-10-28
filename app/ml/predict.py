@@ -44,22 +44,42 @@ _METADATA_PATH = _MODELS_DIR / "metadata.json"
 # Calibration
 # ---------------------------------------------------------------------------
 
+def logit(p: np.ndarray | float) -> np.ndarray | float:
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return np.log(p / (1 - p))
+
+
 class Calibrator:
     """
-    Piecewise-linear isotonic map from raw model probability to calibrated
-    probability, fitted on a held-out split by train.py.  An empty map
-    leaves probabilities unchanged.
+    Map from raw model probability to calibrated probability, fitted on a
+    held-out split by train.py.
+
+    * ``{"method": "sigmoid", "a": .., "b": ..}``: Platt scaling,
+      ``1 / (1 + exp(-(a * logit(p) + b)))``.  Smooth, so no two different
+      matchups collapse onto the same trust value.
+    * ``{"x": [..], "y": [..]}``: piecewise-linear isotonic map (models
+      trained before version 5.0.0).
+
+    An empty spec leaves probabilities unchanged.
     """
 
     def __init__(self, spec: dict | None) -> None:
         spec = spec or {}
+        self.spec = spec
+        self._sigmoid = spec.get("method") == "sigmoid"
+        self._a, self._b = float(spec.get("a", 1.0)), float(spec.get("b", 0.0))
         self._x = np.asarray(spec.get("x", []), dtype=float)
         self._y = np.asarray(spec.get("y", []), dtype=float)
 
     def __call__(self, p: float) -> float:
+        return float(self.predict(np.asarray([p]))[0])
+
+    def predict(self, p: np.ndarray) -> np.ndarray:
+        if self._sigmoid:
+            return 1 / (1 + np.exp(-(self._a * logit(p) + self._b)))
         if self._x.size == 0:
             return p
-        return float(np.interp(p, self._x, self._y))
+        return np.interp(p, self._x, self._y)
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +220,11 @@ class ModelLoader:
 # PredictionEngine
 # ---------------------------------------------------------------------------
 
+def _pick(p1: float, labels: tuple[str, str]) -> tuple[str, float]:
+    """(label, trust %) for probability *p1* of labels[1]."""
+    return (labels[1] if p1 >= 0.5 else labels[0]), round(max(p1, 1.0 - p1) * 100, 1)
+
+
 class PredictionEngine:
     """
     Runs predictions against the loaded XGBoost models.
@@ -227,13 +252,16 @@ class PredictionEngine:
         except KeyError as exc:
             raise KeyError(f"Missing feature column in feature_dict: {exc}.") from exc
         raw_p1 = float(model.predict_proba(X)[0][1])
-        p1 = self._loader.calibrator(model_name)(raw_p1)
-        pick = labels[1] if p1 >= 0.5 else labels[0]
-        return pick, round(max(p1, 1.0 - p1) * 100, 1)
+        return _pick(self._loader.calibrator(model_name)(raw_p1), labels)
 
     def predict(self, feature_dict: dict) -> dict:
         """
         Run the models for the given feature dictionary.
+
+        When the game has a sportsbook money line (``home_market_prob``),
+        the winner pick and trust come from it: in the backtest the no-vig
+        money line beat the model and every blend of the two.  The model's
+        own pick is still returned so it can be shown and graded.
 
         An O/U head is skipped (pick and trust are ``None``) when its
         sportsbook line is missing, because the models were only trained on
@@ -243,8 +271,11 @@ class PredictionEngine:
         Returns
         -------
         dict with keys:
-            winner_pick     : 'Home' | 'Away'
-            winner_trust    : float — calibrated confidence % (50–100)
+            winner_pick        : 'Home' | 'Away'
+            winner_trust       : float — calibrated confidence % (50–100)
+            winner_source      : 'market' | 'model'
+            model_winner_pick  : 'Home' | 'Away' — the model's own pick
+            model_winner_trust : float
             ft_ou_pick      : 'Over' | 'Under' | None
             ft_ou_trust     : float | None
             ht_ou_pick      : 'Over' | 'Under' | None
@@ -264,13 +295,20 @@ class PredictionEngine:
                 "Ensure load_models() is called at application startup."
             )
 
-        winner_pick, winner_trust = self._binary_pick(
+        model_pick, model_trust = self._binary_pick(
             self._loader.winner_model,
             "winner_model",
             feature_dict,
             WINNER_FEATURE_COLUMNS,
             ("Away", "Home"),
         )
+        market_p = feature_dict.get("home_market_prob")
+        if market_p is not None:
+            winner_pick, winner_trust = _pick(market_p, ("Away", "Home"))
+            winner_source = "market"
+        else:
+            winner_pick, winner_trust = model_pick, model_trust
+            winner_source = "model"
 
         ft_ou_pick = ft_ou_trust = None
         if feature_dict.get("ou_line") is not None:
@@ -300,6 +338,9 @@ class PredictionEngine:
         return {
             "winner_pick": winner_pick,
             "winner_trust": winner_trust,
+            "winner_source": winner_source,
+            "model_winner_pick": model_pick,
+            "model_winner_trust": model_trust,
             "ft_ou_pick": ft_ou_pick,
             "ft_ou_trust": ft_ou_trust,
             "ht_ou_pick": ht_ou_pick,

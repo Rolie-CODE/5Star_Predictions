@@ -35,7 +35,7 @@ is gitignored):
 - `data/api_sports_nba_historical_2022_2025.csv` — exported from API-Sports with
   your own key
 - Optional, same Kaggle dataset: `data/kaggle_nba/nba_betting_money_line.csv`
-  (used by the backtest's sportsbook baseline)
+  (used by the backtest's sportsbook baseline; not a model input)
 - Optional: `data/kaggle_nba/csv/game.csv` from the
   [NBA Basketball Database](https://www.kaggle.com/datasets/wyattowalsh/basketball).
   It fills the seasons between the two sources above (2018-19 to 2021-22) and
@@ -59,8 +59,8 @@ are written to `app/ml/models/metadata.json`.
 
 | Model | Test accuracy | Notes |
 |-------|---------------|-------|
-| Winner | ~65.0% | Trust is a calibrated probability. Backtest 2010–2024: 65.7%, against 65.6% for Elo alone and 68.7% for the sportsbook favourite |
-| Full-time O/U | ~50.1% | **No measurable edge** over the sportsbook line; loses about 2% per bet in the backtest |
+| Winner | ~65.0% | Trust is a calibrated probability (sigmoid calibration). Backtest 2010–2024: 66.1%, against 65.6% for Elo alone and 68.7% for the sportsbook favourite |
+| Full-time O/U | ~50.8% | **Not served** (`SERVE_OU_PICKS=false`): no classifier or points-gap model made a profit in the backtest. Picks are still stored and graded |
 | Half-time O/U | — | Not served: no verified historical first-half lines |
 
 Picks are not betting advice; at standard -110 prices you need ~52.4% just to
@@ -103,6 +103,14 @@ are scored by profit per bet at -110. Results go to
 
 `full_time_ou` is `null` for games with no sportsbook line yet, and
 `half_time_ou` is always `null` until a validated half-time model exists.
+
+The winner pick comes from the sportsbook money line when the game has one
+(`winner.source` is `market`): its no-vig probability was more accurate than
+the model in the backtest (68.7% vs 66.8%), and so was every blend of the two.
+`winner.model_pick` and `winner.model_trust` always carry the model's own view,
+so you can show where it disagrees. Games without a line use the model
+(`source` is `model`). `/predictions/performance` grades both, and compares
+them on the games where the market was used.
 
 ### Query params for `/predictions/top`
 - `type` — `winner` (default), `ft_ou`, `ht_ou`

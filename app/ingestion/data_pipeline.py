@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 # API-Sports bet ids / names (from the /bets endpoint).
 _FT_OU_BET = (4, "Over/Under")
 _HT_OU_BET = (5, "Over/Under 1st Half")
+_HOME_AWAY_BET = (2, "Home/Away")
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +155,26 @@ def _extract_line(odds_response: list[dict], bet: tuple[int, str]) -> float | No
         logger.exception("Failed to extract %r line from odds payload.", bet_name)
         return None
     return float(statistics.median(lines)) if lines else None
+
+
+def _extract_home_win_prob(odds_response: list[dict]) -> float | None:
+    """
+    Consensus home-win probability from the Home/Away (money line) bet:
+    each bookmaker's decimal odds with its margin removed, then the median,
+    mirroring how the training data's Kaggle money lines are read.
+    """
+    bet_id, bet_name = _HOME_AWAY_BET
+    probs: list[float] = []
+    for entry in odds_response:
+        for bookmaker in entry.get("bookmakers", []):
+            for b in bookmaker.get("bets", []):
+                if b.get("id") != bet_id and b.get("name") != bet_name:
+                    continue
+                odds = {v.get("value"): _safe_float(v.get("odd")) for v in b.get("values", [])}
+                home, away = odds.get("Home"), odds.get("Away")
+                if home and away and home > 1 and away > 1:
+                    probs.append((1 / home) / (1 / home + 1 / away))
+    return float(statistics.median(probs)) if probs else None
 
 
 def _parse_game(raw: dict) -> dict | None:
@@ -273,15 +294,19 @@ async def _update_lines(db: AsyncSession, game: Game) -> None:
     odds_response = await api_sports_client.get_game_odds(game_id=game.api_sports_id)
     ou_line = _extract_line(odds_response, _FT_OU_BET)
     ht_ou_line = _extract_line(odds_response, _HT_OU_BET)
+    home_win_prob = _extract_home_win_prob(odds_response)
     if ou_line is not None:
         game.ou_line = ou_line
     if ht_ou_line is not None:
         game.ht_ou_line = ht_ou_line
+    if home_win_prob is not None:
+        game.home_win_prob = home_win_prob
     logger.debug(
-        "Odds for game %d: ou_line=%s, ht_ou_line=%s",
+        "Odds for game %d: ou_line=%s, ht_ou_line=%s, home_win_prob=%s",
         game.api_sports_id,
         ou_line,
         ht_ou_line,
+        home_win_prob,
     )
 
 

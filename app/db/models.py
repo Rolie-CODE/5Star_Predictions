@@ -223,6 +223,12 @@ class Game(Base):
         comment="Sportsbook first-half over/under points total.",
     )
 
+    home_win_prob: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Sportsbook home-win probability (no-vig money line, median across books).",
+    )
+
     # ------------------------------------------------------------------ #
     # Relationships
     # ------------------------------------------------------------------ #
@@ -426,6 +432,24 @@ class Prediction(Base):
         Float,
         nullable=False,
         comment="Model confidence for winner pick, in [0, 100].",
+    )
+
+    winner_source: Mapped[str | None] = mapped_column(
+        String(10),
+        nullable=True,
+        comment="'market' (sportsbook money line) or 'model'; NULL on rows from before 4.0.0.",
+    )
+
+    model_winner_pick: Mapped[str | None] = mapped_column(
+        String(10),
+        nullable=True,
+        comment="The model's own winner pick, kept when the market's is served.",
+    )
+
+    model_winner_trust: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+        comment="The model's own winner confidence, in [0, 100].",
     )
 
     # ------------------------------------------------------------------ #

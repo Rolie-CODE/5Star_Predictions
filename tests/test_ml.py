@@ -57,6 +57,21 @@ def test_calibrator_interpolates_and_defaults_to_identity():
     assert Calibrator(None)(0.73) == 0.73
 
 
+def test_sigmoid_calibration_is_smooth_and_round_trips():
+    rng = np.random.default_rng(0)
+    raw = rng.uniform(0.05, 0.95, 5000)
+    # Outcomes drawn from a sharper version of the raw probability.
+    y = (rng.uniform(size=raw.size) < train.Calibrator(
+        {"method": "sigmoid", "a": 1.5, "b": 0.1}
+    ).predict(raw)).astype(int)
+    fitted = train.fit_sigmoid_calibration(raw, y)
+    assert fitted.spec["a"] == pytest.approx(1.5, abs=0.15)
+    assert fitted.spec["b"] == pytest.approx(0.1, abs=0.1)
+    restored = Calibrator(fitted.spec)
+    assert restored(0.6) == pytest.approx(fitted(0.6))
+    assert restored(0.50) < restored(0.501) < restored(0.51)  # no flat steps
+
+
 class _ConstModel:
     def __init__(self, p1):
         self.p1 = p1
@@ -85,6 +100,22 @@ def test_prediction_skips_totals_without_a_line():
     assert (result["winner_pick"], result["winner_trust"]) == ("Away", 70.0)
     assert result["ft_ou_pick"] is None and result["ft_ou_trust"] is None
     assert result["ht_ou_pick"] is None
+
+
+def test_market_line_sets_the_pick_and_the_model_pick_is_kept():
+    values = _features(None)
+    values["home_market_prob"] = 0.62
+    result = PredictionEngine(_FakeLoader()).predict(values)
+    assert (result["winner_pick"], result["winner_trust"], result["winner_source"]) == (
+        "Home", 62.0, "market",
+    )
+    assert (result["model_winner_pick"], result["model_winner_trust"]) == ("Away", 70.0)
+
+
+def test_without_a_market_line_the_model_pick_is_served():
+    result = PredictionEngine(_FakeLoader()).predict(_features(None))
+    assert result["winner_source"] == "model"
+    assert (result["winner_pick"], result["winner_trust"]) == ("Away", 70.0)
 
 
 def test_prediction_with_line():

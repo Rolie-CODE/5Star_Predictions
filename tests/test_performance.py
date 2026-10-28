@@ -55,6 +55,32 @@ def test_performance_grades_finished_games_only(run, session_factory):
     run(scenario())
 
 
+def test_performance_compares_market_and_model_picks(run, session_factory):
+    async def scenario():
+        async with session_factory() as db:
+            a, b = Team(api_sports_id=1, name="A"), Team(api_sports_id=2, name="B")
+            db.add_all([a, b])
+            await db.flush()
+            games = [_game(10, a, b, 120, 100, None), _game(11, a, b, 100, 105, None)]
+            db.add_all(games)
+            await db.flush()
+            market = _prediction(games[0], "Home", None)
+            market.winner_source, market.model_winner_pick = "market", "Away"
+            model = _prediction(games[1], "Home", None)
+            model.winner_source, model.model_winner_pick = "model", "Home"
+            db.add_all([market, model])
+            await db.commit()
+
+            result = await prediction_service.get_performance(db, "2026-2027")
+            assert result["winner"]["correct"] == 1        # market right, model game wrong
+            assert result["model_winner"]["correct"] == 0  # the model was wrong on both
+            assert result["market_games"]["market"]["graded"] == 1
+            assert result["market_games"]["market"]["correct"] == 1
+            assert result["market_games"]["model"]["correct"] == 0
+
+    run(scenario())
+
+
 def test_started_games_keep_their_pregame_prediction(run, session_factory, monkeypatch):
     monkeypatch.setattr(
         prediction_service.prediction_engine, "predict",
@@ -74,5 +100,31 @@ def test_started_games_keep_their_pregame_prediction(run, session_factory, monke
             await db.commit()
 
             assert await prediction_service.run_predictions_for_today(db) == 1
+
+    run(scenario())
+
+
+def test_over_under_picks_are_hidden_unless_switched_on(run, session_factory, monkeypatch):
+    async def scenario():
+        async with session_factory() as db:
+            a, b = Team(api_sports_id=1, name="A"), Team(api_sports_id=2, name="B")
+            db.add_all([a, b])
+            await db.flush()
+            game = _game(10, a, b, None, None, 221.5, status="scheduled",
+                         date=datetime.now(timezone.utc) + timedelta(hours=3))
+            db.add(game)
+            await db.flush()
+            db.add(_prediction(game, "Home", "Over"))
+            await db.commit()
+
+            monkeypatch.setattr(prediction_service.settings, "SERVE_OU_PICKS", False)
+            (hidden,) = await prediction_service.get_upcoming_games_with_predictions(db)
+            assert hidden["prediction"]["full_time_ou"] is None
+            assert await prediction_service.get_top_predictions(db, "ft_ou", 5) == []
+
+            monkeypatch.setattr(prediction_service.settings, "SERVE_OU_PICKS", True)
+            (shown,) = await prediction_service.get_upcoming_games_with_predictions(db)
+            assert shown["prediction"]["full_time_ou"]["pick"] == "Over"
+            assert len(await prediction_service.get_top_predictions(db, "ft_ou", 5)) == 1
 
     run(scenario())
