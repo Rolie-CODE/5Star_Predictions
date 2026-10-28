@@ -44,22 +44,42 @@ _METADATA_PATH = _MODELS_DIR / "metadata.json"
 # Calibration
 # ---------------------------------------------------------------------------
 
+def logit(p: np.ndarray | float) -> np.ndarray | float:
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return np.log(p / (1 - p))
+
+
 class Calibrator:
     """
-    Piecewise-linear isotonic map from raw model probability to calibrated
-    probability, fitted on a held-out split by train.py.  An empty map
-    leaves probabilities unchanged.
+    Map from raw model probability to calibrated probability, fitted on a
+    held-out split by train.py.
+
+    * ``{"method": "sigmoid", "a": .., "b": ..}``: Platt scaling,
+      ``1 / (1 + exp(-(a * logit(p) + b)))``.  Smooth, so no two different
+      matchups collapse onto the same trust value.
+    * ``{"x": [..], "y": [..]}``: piecewise-linear isotonic map (models
+      trained before version 5.0.0).
+
+    An empty spec leaves probabilities unchanged.
     """
 
     def __init__(self, spec: dict | None) -> None:
         spec = spec or {}
+        self.spec = spec
+        self._sigmoid = spec.get("method") == "sigmoid"
+        self._a, self._b = float(spec.get("a", 1.0)), float(spec.get("b", 0.0))
         self._x = np.asarray(spec.get("x", []), dtype=float)
         self._y = np.asarray(spec.get("y", []), dtype=float)
 
     def __call__(self, p: float) -> float:
+        return float(self.predict(np.asarray([p]))[0])
+
+    def predict(self, p: np.ndarray) -> np.ndarray:
+        if self._sigmoid:
+            return 1 / (1 + np.exp(-(self._a * logit(p) + self._b)))
         if self._x.size == 0:
             return p
-        return float(np.interp(p, self._x, self._y))
+        return np.interp(p, self._x, self._y)
 
 
 # ---------------------------------------------------------------------------

@@ -107,6 +107,13 @@ class Settings(BaseSettings):
     TOP_PREDICTIONS_LIMIT: int = 5
     """Default number of top predictions returned by the /top endpoint."""
 
+    SERVE_OU_PICKS: bool = False
+    """
+    Show Over/Under picks in game and top-pick responses.  Off because no
+    Over/Under model has made a profit in the walk-forward backtest; picks
+    are still computed, stored and graded by /predictions/performance.
+    """
+
     # ------------------------------------------------------------------ #
     # Pydantic-settings config
     # ------------------------------------------------------------------ #

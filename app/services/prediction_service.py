@@ -96,12 +96,13 @@ def _game_to_dict(game: Game, prediction: Prediction | None) -> dict:
                 "model_pick": prediction.model_winner_pick or prediction.winner_pick,
                 "model_trust": prediction.model_winner_trust or prediction.winner_trust,
             },
+            # Hidden unless SERVE_OU_PICKS: no O/U model has an edge yet.
             "full_time_ou": _ou_block(
                 prediction.ft_ou_pick, game.ou_line, prediction.ft_ou_trust
-            ),
+            ) if settings.SERVE_OU_PICKS else None,
             "half_time_ou": _ou_block(
                 prediction.ht_ou_pick, game.ht_ou_line, prediction.ht_ou_trust
-            ),
+            ) if settings.SERVE_OU_PICKS else None,
         }
 
     return {
@@ -397,6 +398,9 @@ async def get_top_predictions(
             f"Invalid prediction_type '{prediction_type}'. "
             f"Must be one of: {list(_type_map.keys())}"
         )
+
+    if prediction_type != "winner" and not settings.SERVE_OU_PICKS:
+        return []
 
     pick_col, trust_col, game_line_attr = _type_map[prediction_type]
 

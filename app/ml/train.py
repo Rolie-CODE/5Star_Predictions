@@ -37,7 +37,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import numpy as np
-from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, brier_score_loss
 from xgboost import XGBClassifier
 
@@ -50,6 +50,7 @@ from app.ml.features import (
     is_regular_season,
     season_year,
 )
+from app.ml.predict import Calibrator, logit
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +78,13 @@ FIRST_TRAINING_SEASON: int | None = None
 WINNER_FEATURES = WINNER_FEATURE_COLUMNS
 FT_OU_FEATURES = FT_OU_FEATURE_COLUMNS
 
+# Shallower trees with more, smaller steps: in the walk-forward backtest this
+# beat the earlier 300 x depth 4 x 0.05 on accuracy and Brier score.
 XGB_PARAMS = {
-    "n_estimators": 300,
-    "max_depth": 4,
-    "learning_rate": 0.05,
+    "n_estimators": 600,
+    "max_depth": 3,
+    "learning_rate": 0.02,
+    "min_child_weight": 20,
     "subsample": 0.8,
     "colsample_bytree": 0.8,
     "eval_metric": "logloss",
@@ -345,15 +349,25 @@ def totals_samples(pairs: list[tuple[GameRecord, dict]]) -> tuple[list[list[floa
     return X, y
 
 
+def fit_sigmoid_calibration(raw_p: np.ndarray, y: np.ndarray) -> Calibrator:
+    """
+    Platt scaling of raw probabilities.  In the backtest it beat isotonic
+    regression on Brier score and log loss, and being smooth it never maps
+    different matchups onto one flat step (the source of "50.0%" picks).
+    """
+    lr = LogisticRegression(C=1e6).fit(np.asarray(logit(raw_p)).reshape(-1, 1), y)
+    return Calibrator(
+        {"method": "sigmoid", "a": float(lr.coef_[0][0]), "b": float(lr.intercept_[0])}
+    )
+
+
 def fit_calibrated(
     X_fit: np.ndarray, y_fit: np.ndarray, X_cal: np.ndarray, y_cal: np.ndarray
-) -> tuple[XGBClassifier, IsotonicRegression]:
-    """Fit the classifier, then an isotonic map from its raw to calibrated probability."""
+) -> tuple[XGBClassifier, Calibrator]:
+    """Fit the classifier, then a map from its raw to calibrated probability."""
     model = XGBClassifier(**XGB_PARAMS)
     model.fit(X_fit, y_fit, verbose=False)
-    calibrator = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
-    calibrator.fit(model.predict_proba(X_cal)[:, 1], y_cal)
-    return model, calibrator
+    return model, fit_sigmoid_calibration(model.predict_proba(X_cal)[:, 1], y_cal)
 
 
 def _fit_temporal(name: str, X: list[list[float]], y: list[int]) -> tuple[XGBClassifier, dict]:
@@ -390,10 +404,7 @@ def _fit_temporal(name: str, X: list[list[float]], y: list[int]) -> tuple[XGBCla
         "holdout_method": "chronological: fit oldest 70%, calibrate next 15%, test newest 15%",
         "holdout_accuracy": round(accuracy * 100, 2),
         "holdout_brier": round(brier, 4),
-        "calibration": {
-            "x": [round(float(v), 6) for v in calibrator.X_thresholds_],
-            "y": [round(float(v), 6) for v in calibrator.y_thresholds_],
-        },
+        "calibration": calibrator.spec,
     }
 
 
@@ -523,7 +534,7 @@ def train_models(db_games: list[GameRecord] | None = None) -> None:
     print(f"[train] Saved {CARRYOVER_PATH}")
 
     metadata = {
-        "version": "4.0.0",
+        "version": "5.0.0",
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "data_source": "real_historical",
         "models": {

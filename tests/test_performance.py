@@ -102,3 +102,29 @@ def test_started_games_keep_their_pregame_prediction(run, session_factory, monke
             assert await prediction_service.run_predictions_for_today(db) == 1
 
     run(scenario())
+
+
+def test_over_under_picks_are_hidden_unless_switched_on(run, session_factory, monkeypatch):
+    async def scenario():
+        async with session_factory() as db:
+            a, b = Team(api_sports_id=1, name="A"), Team(api_sports_id=2, name="B")
+            db.add_all([a, b])
+            await db.flush()
+            game = _game(10, a, b, None, None, 221.5, status="scheduled",
+                         date=datetime.now(timezone.utc) + timedelta(hours=3))
+            db.add(game)
+            await db.flush()
+            db.add(_prediction(game, "Home", "Over"))
+            await db.commit()
+
+            monkeypatch.setattr(prediction_service.settings, "SERVE_OU_PICKS", False)
+            (hidden,) = await prediction_service.get_upcoming_games_with_predictions(db)
+            assert hidden["prediction"]["full_time_ou"] is None
+            assert await prediction_service.get_top_predictions(db, "ft_ou", 5) == []
+
+            monkeypatch.setattr(prediction_service.settings, "SERVE_OU_PICKS", True)
+            (shown,) = await prediction_service.get_upcoming_games_with_predictions(db)
+            assert shown["prediction"]["full_time_ou"]["pick"] == "Over"
+            assert len(await prediction_service.get_top_predictions(db, "ft_ou", 5)) == 1
+
+    run(scenario())

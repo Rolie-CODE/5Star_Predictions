@@ -59,8 +59,8 @@ are written to `app/ml/models/metadata.json`.
 
 | Model | Test accuracy | Notes |
 |-------|---------------|-------|
-| Winner | ~65.0% | Trust is a calibrated probability. Backtest 2010–2024: 65.7%, against 65.6% for Elo alone and 68.7% for the sportsbook favourite |
-| Full-time O/U | ~50.1% | **No measurable edge** over the sportsbook line; loses about 2% per bet in the backtest |
+| Winner | ~65.0% | Trust is a calibrated probability (sigmoid calibration). Backtest 2010–2024: 66.1%, against 65.6% for Elo alone and 68.7% for the sportsbook favourite |
+| Full-time O/U | ~50.8% | **Not served** (`SERVE_OU_PICKS=false`): no classifier or points-gap model made a profit in the backtest. Picks are still stored and graded |
 | Half-time O/U | — | Not served: no verified historical first-half lines |
 
 Picks are not betting advice; at standard -110 prices you need ~52.4% just to

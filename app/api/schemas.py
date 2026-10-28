@@ -90,7 +90,10 @@ class GamePrediction(BaseModel):
     winner: WinnerPrediction = Field(..., description="Winner prediction.")
     full_time_ou: OUPrediction | None = Field(
         default=None,
-        description="Full-time Over/Under prediction, or null when no sportsbook line was available.",
+        description=(
+            "Full-time Over/Under prediction, or null when no sportsbook line was available "
+            "or Over/Under picks are switched off (SERVE_OU_PICKS)."
+        ),
     )
     half_time_ou: OUPrediction | None = Field(
         default=None,
