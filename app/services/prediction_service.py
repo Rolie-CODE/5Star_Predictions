@@ -188,12 +188,12 @@ async def run_predictions_for_today(db: AsyncSession) -> int:
         start.date(),
     )
 
-    count = 0
-    for game in games:
-        try:
-            # -- 2. Build feature vector ----------------------------------
-            features = await feature_engineering.build_feature_vector(db, game)
+    # -- 2. Build feature vectors (one replay of the season for all) ------
+    all_features = await feature_engineering.build_feature_vectors(db, games)
 
+    count = 0
+    for game, features in zip(games, all_features):
+        try:
             # -- 3. Run ML models -----------------------------------------
             result_payload: dict = prediction_engine.predict(features)
             # Expected keys in result_payload:

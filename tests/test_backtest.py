@@ -4,22 +4,6 @@ import pytest
 from app.ml import backtest
 
 
-def test_elo_favours_home_then_learns_from_results():
-    elo = backtest.Elo()
-    assert elo.home_win_prob("2024-2025", "A", "B") == pytest.approx(0.64, abs=0.01)
-    elo.update("2024-2025", "A", "B", home_won=False)
-    # B won away, so as the home side B is now a bigger favourite than A was.
-    assert elo.home_win_prob("2024-2025", "B", "A") > 0.65
-
-
-def test_elo_regresses_ratings_between_seasons():
-    elo = backtest.Elo()
-    for _ in range(20):
-        elo.update("2023-2024", "A", "B", home_won=True)
-    late = elo.home_win_prob("2023-2024", "A", "B")
-    assert elo.home_win_prob("2024-2025", "A", "B") < late
-
-
 def test_betting_record_at_minus_110():
     y = np.array([1, 1, 0, 0])
     p = np.array([0.7, 0.4, 0.3, 0.52])

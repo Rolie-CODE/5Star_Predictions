@@ -7,6 +7,10 @@ totals model uses every game with an observed sportsbook total.  No
 synthetic fallback is used.  Pass ``--no-db`` to train from the CSV files
 only (used at build time, before a database exists).
 
+All sources are replayed as one history (API-Sports teams are matched to
+NBA.com ids by name), so Elo ratings carry over between seasons.  The state
+after the last game is saved to ``carryover.json`` for live inference.
+
 Each model is fitted on the oldest 70% of games, calibrated on the next
 15%, and scored on the newest 15%, all in chronological order.
 
@@ -25,7 +29,7 @@ import logging
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -35,11 +39,12 @@ from xgboost import XGBClassifier
 
 from app.core.config import settings
 from app.ml.features import (
+    CARRYOVER_PATH,
     FT_OU_FEATURE_COLUMNS,
     WINNER_FEATURE_COLUMNS,
-    TeamForm,
-    features_from_forms,
+    LeagueHistory,
     is_regular_season,
+    season_year,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +60,8 @@ MONEY_LINE_FILE = KAGGLE_DIR / "nba_betting_money_line.csv"
 # API-Sports covers seasons from this start year on; NBA Database games from
 # these seasons are skipped so no game is counted twice.
 API_SPORTS_FIRST_SEASON = 2022
+# API-Sports teams with fewer games than this in a season are exhibition sides.
+MIN_TEAM_SEASON_GAMES = 10
 
 RNG_SEED = 42
 MIN_TRAINING_ROWS = 100
@@ -290,43 +297,47 @@ def _as_naive_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
 
 
-def _features_for_records(
+def _record_day(game: GameRecord) -> date:
+    """League-local date: Kaggle-format dates already are; API-Sports ones are UTC."""
+    return game.date.date() if game.game_id.startswith("kaggle:") else _league_date(game.date)
+
+
+def pregame_features(
     records: list[GameRecord],
-) -> tuple[list[GameRecord], list[list[float]], list[int], list[GameRecord], list[list[float]], list[int]]:
+) -> tuple[list[tuple[GameRecord, dict]], LeagueHistory]:
     """
-    Build leak-safe pregame rolling stats and head-specific samples.
-
-    Returns (winner records, X, y, totals records, X, y), each in
-    chronological order.
+    Leak-safe feature dict for every game, in chronological order, and the
+    history state after the last game (the live carryover).
     """
-    forms: dict[tuple[str, str], TeamForm] = defaultdict(TeamForm)
-    winner_rows: list[GameRecord] = []
-    winner_x: list[list[float]] = []
-    winner_y: list[int] = []
-    totals_rows: list[GameRecord] = []
-    totals_x: list[list[float]] = []
-    totals_y: list[int] = []
-
+    history = LeagueHistory()
+    pairs: list[tuple[GameRecord, dict]] = []
     for game in sorted(records, key=lambda item: (item.date, item.season, item.home_id)):
-        home = forms[(game.season, game.home_id)]
-        away = forms[(game.season, game.away_id)]
-        values = features_from_forms(home, away, game.ou_line, None)
+        season, day = season_year(game.season), _record_day(game)
+        pairs.append((game, history.features(season, day, game.home_id, game.away_id, game.ou_line)))
+        # Update only after the features were taken (no leakage).
+        history.add_result(season, day, game.home_id, game.away_id, game.home_score, game.away_score)
+    return pairs, history
 
-        winner_rows.append(game)
-        winner_x.append([float(values[name]) for name in WINNER_FEATURES])
-        winner_y.append(int(game.home_score > game.away_score))
 
-        total = game.home_score + game.away_score
-        if game.ou_line is not None and total != game.ou_line:
-            totals_rows.append(game)
-            totals_x.append([float(values[name]) for name in FT_OU_FEATURES])
-            totals_y.append(int(total > game.ou_line))
+def winner_samples(pairs: list[tuple[GameRecord, dict]]) -> tuple[list[list[float]], list[int]]:
+    X = [[float(values[name]) for name in WINNER_FEATURES] for _, values in pairs]
+    y = [int(game.home_score > game.away_score) for game, _ in pairs]
+    return X, y
 
-        # Update form only after the features were taken (no leakage).
-        home.add_game(game.home_score, game.away_score, is_home=True)
-        away.add_game(game.away_score, game.home_score, is_home=False)
 
-    return winner_rows, winner_x, winner_y, totals_rows, totals_x, totals_y
+def totals_pairs(pairs: list[tuple[GameRecord, dict]]) -> list[tuple[GameRecord, dict]]:
+    """Games with a sportsbook total that did not land exactly on it."""
+    return [
+        (game, values) for game, values in pairs
+        if game.ou_line is not None and game.home_score + game.away_score != game.ou_line
+    ]
+
+
+def totals_samples(pairs: list[tuple[GameRecord, dict]]) -> tuple[list[list[float]], list[int]]:
+    """Expects ``totals_pairs`` output."""
+    X = [[float(values[name]) for name in FT_OU_FEATURES] for _, values in pairs]
+    y = [int(game.home_score + game.away_score > game.ou_line) for game, _ in pairs]
+    return X, y
 
 
 def fit_calibrated(
@@ -386,14 +397,36 @@ def _save_model(model: XGBClassifier, filename: str) -> None:
     print(f"[train] Saved {MODELS_DIR / filename}")
 
 
+def _api_to_nba_team_ids() -> dict[str, str]:
+    """
+    API-Sports team id -> NBA.com team id, matched by current team name, so
+    one team's history runs unbroken across both sources.  API-Sports teams
+    without a match get an id of their own ("api:<id>").
+    """
+    api_names: dict[str, str] = {}
+    with API_SPORTS_FILE.open(encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            api_names[row["home_team_id"]] = row["home_team"]
+            api_names[row["away_team_id"]] = row["away_team"]
+
+    nba_ids: dict[str, str] = {}
+    if NBA_DB_GAMES_FILE.exists():
+        with NBA_DB_GAMES_FILE.open(encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                # Later rows win, so current franchise names map to their ids.
+                nba_ids[row["team_name_home"]] = row["team_id_home"]
+                nba_ids[row["team_name_away"]] = row["team_id_away"]
+    return {api_id: nba_ids.get(name, f"api:{api_id}") for api_id, name in api_names.items()}
+
+
 def load_records(
     db_games: list[GameRecord] | None = None,
     first_season: int | None = None,
-) -> tuple[list[GameRecord], list[GameRecord]]:
+) -> tuple[list[GameRecord], dict[str, str]]:
     """
-    Return (Kaggle games, API-Sports games).  Each source keeps its own team
-    ids, so build features for them separately.  Kaggle seasons that start
-    before *first_season* are dropped.
+    Every game from every source with NBA.com team ids where known, plus the
+    map from those ids back to API-Sports ids (used for the live carryover).
+    Kaggle seasons that start before *first_season* are dropped.
     """
     print("[train] Loading real Kaggle, NBA Database and API-Sports game results")
     totals = _read_totals()
@@ -421,41 +454,71 @@ def load_records(
     csv_count = len(api_by_id)
     api_by_id.update({game.game_id: game for game in (db_games or [])})
     api_games = list(api_by_id.values())
+
+    team_ids = _api_to_nba_team_ids()
+    for game in api_games:
+        # The app database can hold a team the CSV never saw.
+        game.home_id = team_ids.setdefault(game.home_id, f"api:{game.home_id}")
+        game.away_id = team_ids.setdefault(game.away_id, f"api:{game.away_id}")
+    unmatched = sorted(api for api, team in team_ids.items() if team.startswith("api:"))
+
+    # The live server replays the current season on top of the carryover.
+    current = season_year(settings.NBA_SEASON)
+    before = len(kaggle_games) + len(api_games)
+    kaggle_games = [game for game in kaggle_games if season_year(game.season) < current]
+    api_games = [game for game in api_games if season_year(game.season) < current]
+    current_season_games = before - len(kaggle_games) - len(api_games)
+
+    # API-Sports lists All-Star exhibitions under the NBA during the regular
+    # season; their teams play a game or two, real teams about 82.
+    games_played: dict[tuple[str, str], int] = defaultdict(int)
+    for game in api_games:
+        games_played[(game.season, game.home_id)] += 1
+        games_played[(game.season, game.away_id)] += 1
+    api_count = len(api_games)
+    api_games = [
+        game for game in api_games
+        if games_played[(game.season, game.home_id)] >= MIN_TEAM_SEASON_GAMES
+        and games_played[(game.season, game.away_id)] >= MIN_TEAM_SEASON_GAMES
+    ]
+    exhibitions = api_count - len(api_games)
+    records = kaggle_games + api_games
     print(
         f"[train] Kaggle + NBA Database: {len(kaggle_games)} regular-season results "
         f"({nba_db_added} from the NBA Database), "
         f"{sum(game.ou_line is not None for game in kaggle_games)} with full-game totals, "
         f"{sum(game.home_market_prob is not None for game in kaggle_games)} with money lines; "
         f"API-Sports CSV: {csv_count} regular-season results; "
-        f"app database: {len(db_games or [])} finished games"
+        f"app database: {len(db_games or [])} finished games; "
+        f"API-Sports teams without an NBA.com match: {unmatched or 'none'}; "
+        f"left out: {exhibitions} exhibition and {current_season_games} current-season games"
     )
-    return kaggle_games, api_games
+    nba_to_api = {team: api for api, team in team_ids.items()}
+    return records, nba_to_api
 
 
 def train_models(db_games: list[GameRecord] | None = None) -> None:
     """CPU-bound training; call via ``asyncio.to_thread`` from async code."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    kaggle_games, api_games = load_records(db_games, FIRST_TRAINING_SEASON)
+    records, nba_to_api = load_records(db_games, FIRST_TRAINING_SEASON)
+    pairs, history = pregame_features(records)
 
-    # Build each source independently so a team's historical form never
-    # crosses datasets or season boundaries.
-    k_rows, k_wx, k_wy, k_trows, k_tx, k_ty = _features_for_records(kaggle_games)
-    a_rows, a_wx, a_wy, a_trows, a_tx, a_ty = _features_for_records(api_games)
-
-    def _chronological(rows, xs, ys):
-        merged = sorted(zip(rows, xs, ys), key=lambda row: (row[0].date, row[0].season))
-        return [row[1] for row in merged], [row[2] for row in merged]
-
-    winner_x, winner_y = _chronological(k_rows + a_rows, k_wx + a_wx, k_wy + a_wy)
-    ft_x, ft_y = _chronological(k_trows + a_trows, k_tx + a_tx, k_ty + a_ty)
+    winner_x, winner_y = winner_samples(pairs)
+    ft_x, ft_y = totals_samples(totals_pairs(pairs))
 
     winner_model, winner_meta = _fit_temporal("winner_model", winner_x, winner_y)
     ft_model, ft_meta = _fit_temporal("ft_ou_model", ft_x, ft_y)
     _save_model(winner_model, "winner_model.json")
     _save_model(ft_model, "ft_ou_model.json")
 
+    # Live inference continues this history in API-Sports team ids.
+    CARRYOVER_PATH.write_text(
+        json.dumps(history.carryover(nba_to_api), indent=2), encoding="utf-8"
+    )
+    print(f"[train] Saved {CARRYOVER_PATH}")
+
     metadata = {
-        "version": "3.0.0",
+        "version": "4.0.0",
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "data_source": "real_historical",
         "models": {

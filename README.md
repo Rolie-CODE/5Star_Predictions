@@ -34,9 +34,24 @@ is gitignored):
   (license listed as unknown, so it isn't redistributed here)
 - `data/api_sports_nba_historical_2022_2025.csv` — exported from API-Sports with
   your own key
+- Optional, same Kaggle dataset: `data/kaggle_nba/nba_betting_money_line.csv`
+  (used by the backtest's sportsbook baseline)
+- Optional: `data/kaggle_nba/csv/game.csv` from the
+  [NBA Basketball Database](https://www.kaggle.com/datasets/wyattowalsh/basketball).
+  It fills the seasons between the two sources above (2018-19 to 2021-22) and
+  is used to match API-Sports teams to NBA.com ids.
 
-Training also uses every finished game the app has stored in its database
-(point `DATABASE_URL` at the production database to include those).
+Training also uses every finished game from past seasons that the app has
+stored in its database (point `DATABASE_URL` at the production database to
+include those). The current season is left out: the server replays it itself.
+
+All games are replayed as one history to build each game's pre-game
+features: Elo ratings that carry over between seasons, season-to-date net
+rating and win rates, recent form, rest days and back-to-backs, and scoring
+relative to the league average. Training saves the state after the last game
+to `app/ml/models/carryover.json`; the server starts each season from it and
+replays the season's stored games on top. Retrain after each season so the
+carryover includes it.
 
 Only regular-season games are used. Each model is fitted on the oldest 70% of
 games, calibrated on the next 15%, and scored on the newest 15%; the results
@@ -44,8 +59,8 @@ are written to `app/ml/models/metadata.json`.
 
 | Model | Test accuracy | Notes |
 |-------|---------------|-------|
-| Winner | ~64.7% | Trust is a calibrated probability |
-| Full-time O/U | ~50.9% | **No measurable edge** over the sportsbook line |
+| Winner | ~65.0% | Trust is a calibrated probability. Backtest 2010–2024: 65.7%, against 65.6% for Elo alone and 68.7% for the sportsbook favourite |
+| Full-time O/U | ~50.1% | **No measurable edge** over the sportsbook line; loses about 2% per bet in the backtest |
 | Half-time O/U | — | Not served: no verified historical first-half lines |
 
 Picks are not betting advice; at standard -110 prices you need ~52.4% just to
