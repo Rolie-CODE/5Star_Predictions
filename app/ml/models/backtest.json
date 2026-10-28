@@ -1,7 +1,8 @@
 {
-  "generated_at": "2026-10-28T04:03:39.229363+00:00",
+  "generated_at": "2026-10-28T04:16:39.643619+00:00",
   "method": "walk-forward by season: fit on earlier seasons, calibrate on the latest seasons before the test season (>= 1000 games), test on the season",
   "first_test_season": 2010,
+  "first_training_season": null,
   "winner_model": {
     "seasons": {
       "2010": {

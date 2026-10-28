@@ -256,9 +256,13 @@ def _print_totals(result: dict) -> None:
         )
 
 
-def run_backtest(db_games: list[train.GameRecord], first_season: int) -> dict:
+def run_backtest(
+    db_games: list[train.GameRecord],
+    first_season: int,
+    first_train_season: int | None = train.FIRST_TRAINING_SEASON,
+) -> dict:
     """CPU-bound; builds every per-season model and returns the report."""
-    kaggle_games, api_games = train.load_records(db_games)
+    kaggle_games, api_games = train.load_records(db_games, first_train_season)
     winner: list[Sample] = []
     totals: list[Sample] = []
     for records in (kaggle_games, api_games):
@@ -273,6 +277,7 @@ def run_backtest(db_games: list[train.GameRecord], first_season: int) -> dict:
             f"seasons before the test season (>= {MIN_CALIBRATION_ROWS} games), test on the season"
         ),
         "first_test_season": first_season,
+        "first_training_season": first_train_season,
         "winner_model": _evaluate(winner, first_season, winner_metrics),
         "ft_ou_model": _evaluate(totals, first_season, totals_metrics),
     }
@@ -283,9 +288,9 @@ def run_backtest(db_games: list[train.GameRecord], first_season: int) -> dict:
     return report
 
 
-async def main(use_db: bool, first_season: int) -> None:
+async def main(use_db: bool, first_season: int, first_train_season: int | None) -> None:
     db_games = await train.read_db_games_or_none() if use_db else []
-    await asyncio.to_thread(run_backtest, db_games, first_season)
+    await asyncio.to_thread(run_backtest, db_games, first_season, first_train_season)
 
 
 if __name__ == "__main__":
@@ -295,5 +300,10 @@ if __name__ == "__main__":
         "--first-season", type=int, default=FIRST_TEST_SEASON,
         help=f"first season (start year) to test on, default {FIRST_TEST_SEASON}",
     )
+    parser.add_argument(
+        "--first-train-season", type=int, default=train.FIRST_TRAINING_SEASON,
+        help="drop seasons (start year) before this from the data, default "
+        f"{train.FIRST_TRAINING_SEASON}",
+    )
     args = parser.parse_args()
-    asyncio.run(main(use_db=not args.no_db, first_season=args.first_season))
+    asyncio.run(main(not args.no_db, args.first_season, args.first_train_season))

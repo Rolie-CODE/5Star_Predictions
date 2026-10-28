@@ -52,6 +52,8 @@ RNG_SEED = 42
 MIN_TRAINING_ROWS = 100
 TRAIN_FRACTION = 0.70
 CALIBRATION_FRACTION = 0.15
+# Seasons (start year) before this are left out of training; None keeps all.
+FIRST_TRAINING_SEASON: int | None = None
 
 WINNER_FEATURES = WINNER_FEATURE_COLUMNS
 FT_OU_FEATURES = FT_OU_FEATURE_COLUMNS
@@ -312,14 +314,19 @@ def _save_model(model: XGBClassifier, filename: str) -> None:
 
 def load_records(
     db_games: list[GameRecord] | None = None,
+    first_season: int | None = None,
 ) -> tuple[list[GameRecord], list[GameRecord]]:
     """
     Return (Kaggle games, API-Sports games).  Each source keeps its own team
-    ids, so build features for them separately.
+    ids, so build features for them separately.  Kaggle seasons that start
+    before *first_season* are dropped.
     """
     print("[train] Loading real Kaggle and API-Sports game results")
     totals = _read_totals()
-    kaggle_games = _read_kaggle_games(totals)
+    kaggle_games = [
+        game for game in _read_kaggle_games(totals)
+        if first_season is None or int(game.season[:4]) >= first_season
+    ]
 
     # API-Sports CSV and app DB share the same game ids; the DB copy wins.
     api_by_id = {game.game_id: game for game in _read_api_sports_games()}
@@ -338,7 +345,7 @@ def load_records(
 def train_models(db_games: list[GameRecord] | None = None) -> None:
     """CPU-bound training; call via ``asyncio.to_thread`` from async code."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    kaggle_games, api_games = load_records(db_games)
+    kaggle_games, api_games = load_records(db_games, FIRST_TRAINING_SEASON)
 
     # Build each source independently so a team's historical form never
     # crosses datasets or season boundaries.

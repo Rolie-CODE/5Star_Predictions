@@ -63,6 +63,15 @@ http://localhost:8000/docs
 pytest
 ```
 
+### 6. Backtest the models
+```bash
+python -m app.ml.backtest       # about a minute; needs the training data
+```
+Rebuilds the models once per season from 2010 on, using only earlier seasons,
+and compares them with "always home" and a basic Elo rating. Over/Under picks
+are scored by profit per bet at -110. Results go to
+`app/ml/models/backtest.json`. Run it before and after any model change.
+
 ---
 
 ## API Endpoints
@@ -74,6 +83,7 @@ pytest
 | `GET` | `/games/upcoming` | Games in the next 24 hours |
 | `GET` | `/games/{game_id}` | Single game + full prediction detail |
 | `GET` | `/predictions/top` | Top highest-trust picks |
+| `GET` | `/predictions/performance` | Stored picks graded against final scores (`season`, `model_version` optional) |
 | `POST` | `/predictions/refresh` | Run the full pipeline now — requires `X-API-Key: <ADMIN_API_KEY>` |
 
 `full_time_ou` is `null` for games with no sportsbook line yet, and
@@ -92,7 +102,9 @@ On the **Free** API-Sports plan:
   fetched by date only (yesterday → tomorrow is allowed) and filtered to the NBA.
 - Odds are available; lines are the median main line across all bookmakers.
 - 100 requests/day and 10/minute. The client throttles itself to
-  `API_SPORTS_MAX_REQUESTS_PER_MINUTE`; the scheduled jobs use about 40/day.
+  `API_SPORTS_MAX_REQUESTS_PER_MINUTE`; the scheduled jobs use about 65/day
+  on a busy day.
+- Past seasons are limited to 2022–2024.
 
 Team stats are computed from the finished games stored in the app's own
 database (same code as training). On the Free plan the database only knows the
@@ -108,8 +120,8 @@ Times are US Eastern (`LEAGUE_TIMEZONE`).
 
 | Job | Schedule | What it does |
 |-----|----------|--------------|
-| `catch_up` | At startup | Fills in anything missed while the server was down or asleep |
-| `fetch_and_predict` | Daily 10:00 and 17:00 | Syncs results, today's games + lines, team stats; runs predictions |
+| `catch_up` | At startup | Syncs yesterday's results and predicts today's and tomorrow's games if any are missing. On the Free plan, results from before yesterday can't be fetched, so days the server was down for longer are lost |
+| `fetch_and_predict` | Daily 10:00 and 17:00 | Syncs results, today's and tomorrow's games + lines, team stats; runs predictions |
 | `fetch_results` | 19:00–03:00, every 2 hours | Updates scores (yesterday + today) and team stats |
 
 Models are retrained locally, not on the server (see step 3).
