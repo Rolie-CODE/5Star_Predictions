@@ -7,11 +7,11 @@ them, using only what was known before that season: fitted on all earlier
 seasons except the latest ones, calibrated on those latest seasons, then
 scored on the test season.  Results are compared with simple baselines:
 
-* Winner: "always pick the home team" and a basic Elo rating.
+* Winner: "always pick the home team", a basic Elo rating and, where the
+  money-line file has the game (2006-07 to 2017-18), the sportsbook
+  favourite.  The sportsbook comparison uses only those games.
 * Full-game totals: "always Over" / "always Under", and profit per bet at
   standard -110 prices (52.4% is break-even).
-
-No sportsbook-favourite baseline yet: the training data has no money lines.
 
 Results are printed and written to ``app/ml/models/backtest.json``.
 """
@@ -106,6 +106,7 @@ class Sample:
     x: list[float]
     y: int
     elo_p: float | None = None
+    market_p: float | None = None
 
 
 def build_samples(records: list[train.GameRecord]) -> tuple[list[Sample], list[Sample]]:
@@ -113,7 +114,8 @@ def build_samples(records: list[train.GameRecord]) -> tuple[list[Sample], list[S
     rows, wx, wy, trows, tx, ty = train._features_for_records(records)
     elo = elo_home_probs(records)
     winner = [
-        Sample(season_year(r.season), x, y, elo[r.game_id]) for r, x, y in zip(rows, wx, wy)
+        Sample(season_year(r.season), x, y, elo[r.game_id], r.home_market_prob)
+        for r, x, y in zip(rows, wx, wy)
     ]
     totals = [Sample(season_year(r.season), x, y) for r, x, y in zip(trows, tx, ty)]
     return winner, totals
@@ -186,6 +188,23 @@ def winner_metrics(held_out: list[Sample], p: np.ndarray) -> dict:
         "always_home_accuracy": round(float(y.mean()), 4),
         "elo_accuracy": round(accuracy(y, elo_p), 4),
         "elo_brier": round(float(brier_score_loss(y, elo_p)), 4),
+        **_market_metrics(held_out, p),
+    }
+
+
+def _market_metrics(held_out: list[Sample], p: np.ndarray) -> dict:
+    """Model vs. sportsbook favourite, on the games that have a money line."""
+    has_line = np.asarray([s.market_p is not None for s in held_out])
+    if not has_line.any():
+        return {"market_games": 0}
+    y = np.asarray([s.y for s in held_out])[has_line]
+    market_p = np.asarray([s.market_p for s in held_out if s.market_p is not None])
+    return {
+        "market_games": int(has_line.sum()),
+        "model_accuracy_on_market_games": round(accuracy(y, p[has_line]), 4),
+        "market_accuracy": round(accuracy(y, market_p), 4),
+        "model_brier_on_market_games": round(float(brier_score_loss(y, p[has_line])), 4),
+        "market_brier": round(float(brier_score_loss(y, market_p)), 4),
     }
 
 
@@ -227,7 +246,10 @@ def _pct(value: float | None) -> str:
 
 def _print_winner(result: dict) -> None:
     print("\nWinner model (accuracy; Brier, lower is better)")
-    print(f"{'season':>8} {'games':>6} {'model':>7} {'home':>7} {'elo':>7} {'brier':>7} {'elo br':>7}")
+    print(
+        f"{'season':>8} {'games':>6} {'model':>7} {'home':>7} {'elo':>7} {'brier':>7} "
+        f"{'elo br':>7}   {'w/line':>6} {'model':>7} {'book':>7} {'brier':>7} {'book br':>7}"
+    )
     rows = list(result["seasons"].items()) + [("all", result["all_test_seasons"])]
     for season, m in rows:
         if m is None:
@@ -235,8 +257,18 @@ def _print_winner(result: dict) -> None:
         print(
             f"{season:>8} {m['games']:>6} {_pct(m['model_accuracy'])} "
             f"{_pct(m['always_home_accuracy'])} {_pct(m['elo_accuracy'])} "
-            f"{m['model_brier']:>7.4f} {m['elo_brier']:>7.4f}"
+            f"{m['model_brier']:>7.4f} {m['elo_brier']:>7.4f}{_market_columns(m)}"
         )
+
+
+def _market_columns(m: dict) -> str:
+    if not m["market_games"]:
+        return ""
+    return (
+        f"   {m['market_games']:>6} {_pct(m['model_accuracy_on_market_games'])} "
+        f"{_pct(m['market_accuracy'])} {m['model_brier_on_market_games']:>7.4f} "
+        f"{m['market_brier']:>7.4f}"
+    )
 
 
 def _print_totals(result: dict) -> None:

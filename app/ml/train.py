@@ -1,7 +1,8 @@
 """Train NBA prediction models from verified historical game data.
 
 Run from the project root with ``python -m app.ml.train``.  The winner model
-uses Kaggle, API-Sports and the app's own finished games.  The full-game
+uses Kaggle, the NBA Database (seasons Kaggle lacks, up to 2021-22),
+API-Sports and the app's own finished games.  The full-game
 totals model uses every game with an observed sportsbook total.  No
 synthetic fallback is used.  Pass ``--no-db`` to train from the CSV files
 only (used at build time, before a database exists).
@@ -47,6 +48,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODELS_DIR = PROJECT_ROOT / "app" / "ml" / "models"
 KAGGLE_DIR = PROJECT_ROOT / "data" / "kaggle_nba"
 API_SPORTS_FILE = PROJECT_ROOT / "data" / "api_sports_nba_historical_2022_2025.csv"
+# Optional: the "NBA Basketball Database" (wyattowalsh/basketball) game table
+# and the Kaggle money lines.  Both use the same NBA.com game ids as Kaggle.
+NBA_DB_GAMES_FILE = KAGGLE_DIR / "csv" / "game.csv"
+MONEY_LINE_FILE = KAGGLE_DIR / "nba_betting_money_line.csv"
+# API-Sports covers seasons from this start year on; NBA Database games from
+# these seasons are skipped so no game is counted twice.
+API_SPORTS_FIRST_SEASON = 2022
 
 RNG_SEED = 42
 MIN_TRAINING_ROWS = 100
@@ -80,6 +88,8 @@ class GameRecord:
     home_score: int
     away_score: int
     ou_line: float | None = None
+    # No-vig sportsbook home-win probability (median across books), if known.
+    home_market_prob: float | None = None
 
 
 def _league_date(value: datetime):
@@ -144,6 +154,70 @@ def _read_kaggle_games(totals: dict[str, float]) -> list[GameRecord]:
         except (KeyError, TypeError, ValueError):
             continue
     return records
+
+
+def _read_nba_db_games() -> list[GameRecord]:
+    """Regular-season games from the NBA Database before API-Sports' seasons."""
+    if not NBA_DB_GAMES_FILE.exists():
+        print(f"[train] {NBA_DB_GAMES_FILE} not found; skipping the NBA Database")
+        return []
+
+    records: list[GameRecord] = []
+    with NBA_DB_GAMES_FILE.open(encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("season_type") != "Regular Season":
+                continue
+            try:
+                # season_id "22018" -> the 2018-19 season, in Kaggle's format.
+                start_year = int(row["season_id"][1:])
+                if start_year >= API_SPORTS_FIRST_SEASON:
+                    continue
+                records.append(
+                    GameRecord(
+                        game_id=f"kaggle:{row['game_id']}",
+                        date=datetime.fromisoformat(row["game_date"]),
+                        season=f"{start_year}-{str(start_year + 1)[-2:]}",
+                        home_id=row["team_id_home"],
+                        away_id=row["team_id_away"],
+                        home_score=int(float(row["pts_home"])),
+                        away_score=int(float(row["pts_away"])),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+    return records
+
+
+def _implied_prob(american: float) -> float:
+    """Win probability implied by American odds, vig included."""
+    return 100 / (american + 100) if american > 0 else -american / (-american + 100)
+
+
+def _read_money_lines() -> dict[str, tuple[str, float]]:
+    """
+    Map NBA.com game id -> (team id, that team's no-vig win probability),
+    the median across bookmakers.
+    """
+    if not MONEY_LINE_FILE.exists():
+        print(f"[train] {MONEY_LINE_FILE} not found; no sportsbook win probabilities")
+        return {}
+
+    by_game: dict[str, tuple[str, list[float]]] = {}
+    with MONEY_LINE_FILE.open(encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                team_p = _implied_prob(float(row["price1"]))
+                other_p = _implied_prob(float(row["price2"]))
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                continue
+            team_id, probs = by_game.setdefault(row["game_id"], (row["team_id"], []))
+            if row["team_id"] != team_id:
+                team_p, other_p = other_p, team_p
+            probs.append(team_p / (team_p + other_p))
+    return {
+        game_id: (team_id, float(statistics.median(probs)))
+        for game_id, (team_id, probs) in by_game.items()
+    }
 
 
 def _read_api_sports_games() -> list[GameRecord]:
@@ -321,10 +395,24 @@ def load_records(
     ids, so build features for them separately.  Kaggle seasons that start
     before *first_season* are dropped.
     """
-    print("[train] Loading real Kaggle and API-Sports game results")
+    print("[train] Loading real Kaggle, NBA Database and API-Sports game results")
     totals = _read_totals()
+    # Same NBA.com game ids: keep each Kaggle game, add the ones it lacks.
+    kaggle_by_id = {game.game_id: game for game in _read_kaggle_games(totals)}
+    kaggle_count = len(kaggle_by_id)
+    for game in _read_nba_db_games():
+        kaggle_by_id.setdefault(game.game_id, game)
+    nba_db_added = len(kaggle_by_id) - kaggle_count
+
+    money_lines = _read_money_lines()
+    for game in kaggle_by_id.values():
+        line = money_lines.get(game.game_id.removeprefix("kaggle:"))
+        if line is not None:
+            team_id, team_p = line
+            game.home_market_prob = team_p if team_id == game.home_id else 1 - team_p
+
     kaggle_games = [
-        game for game in _read_kaggle_games(totals)
+        game for game in kaggle_by_id.values()
         if first_season is None or int(game.season[:4]) >= first_season
     ]
 
@@ -334,8 +422,10 @@ def load_records(
     api_by_id.update({game.game_id: game for game in (db_games or [])})
     api_games = list(api_by_id.values())
     print(
-        f"[train] Kaggle: {len(kaggle_games)} regular-season results, "
-        f"{sum(game.ou_line is not None for game in kaggle_games)} with full-game totals; "
+        f"[train] Kaggle + NBA Database: {len(kaggle_games)} regular-season results "
+        f"({nba_db_added} from the NBA Database), "
+        f"{sum(game.ou_line is not None for game in kaggle_games)} with full-game totals, "
+        f"{sum(game.home_market_prob is not None for game in kaggle_games)} with money lines; "
         f"API-Sports CSV: {csv_count} regular-season results; "
         f"app database: {len(db_games or [])} finished games"
     )
@@ -370,7 +460,7 @@ def train_models(db_games: list[GameRecord] | None = None) -> None:
         "data_source": "real_historical",
         "models": {
             "winner_model": {
-                "data_source": "Kaggle NBA results + API-Sports 2022-2025 + app database",
+                "data_source": "Kaggle + NBA Database results + API-Sports 2022-2025 + app database",
                 "feature_columns": WINNER_FEATURES,
                 **winner_meta,
             },
